@@ -12,9 +12,10 @@
 #include <stdexcept>
 #include <string>
 
-#include "gemmi/ace_graph.hpp"      // expected_valence_for_nonmetal, build_bond_adjacency
-#include "gemmi/acedrg_tables.hpp"  // AcedrgTables (used in prepare_chemlink stub)
-#include "gemmi/util.hpp"           // vector_remove_if
+#include "gemmi/ace_cc.hpp"          // prepare_chemcomp, PrepareChemcompOptions
+#include "gemmi/ace_graph.hpp"       // expected_valence_for_nonmetal, build_bond_adjacency
+#include "gemmi/acedrg_tables.hpp"   // AcedrgTables
+#include "gemmi/util.hpp"            // vector_remove_if
 
 namespace gemmi {
 
@@ -270,11 +271,425 @@ ChemComp make_joined_chemcomp(const ChemComp& cc1, const ChemComp& cc2,
   return joined;
 }
 
-// ─── prepare_chemlink — stub for now (Task 6) ────────────────────────────────
+// ─── prepare_chemlink dispatch helpers (file-local) ─────────────────────────
 
-LinkGenerationResult prepare_chemlink(const ChemComp&, const ChemComp&,
-                                      const LinkSpec&, const AcedrgTables&) {
-  throw std::runtime_error("prepare_chemlink: not implemented yet");
+namespace {
+
+// Function codes used in ChemMod restraint rows: matches chem_mod_type() in
+// monlib.cpp ('a' = add, 'c' = change, 'd' = delete).
+constexpr int kMod_Add    = 'a';
+constexpr int kMod_Change = 'c';
+constexpr int kMod_Delete = 'd';
+
+// Tolerance for considering two restraint values "the same" so we don't
+// emit a `change` row for cosmetic noise. These are deliberately on the
+// loose side: AceDRG emits 'change' only when the atom-type-tuple lookup
+// key changes, so the resulting value almost always differs by more than
+// noise. Tight tolerances here produce spurious changes for values that
+// got re-derived with rounding drift.
+constexpr double kBondValueTol  = 0.003;   // Angstrom
+constexpr double kBondEsdTol    = 0.0015;  // sigma
+constexpr double kAngleValueTol = 0.3;     // degree
+constexpr double kAngleEsdTol   = 0.1;     // degree
+
+// Re-tag every AtomId in `r` with `comp` (rebinds the meaning of the comp
+// field). Use kMod_* for ChemMod rt rows, side numbers for ChemLink rt rows.
+Restraints::Bond retag(const Restraints::Bond& src, int new_comp,
+                       const std::string& a1, const std::string& a2) {
+  Restraints::Bond out = src;
+  out.id1 = {new_comp, a1};
+  out.id2 = {new_comp, a2};
+  return out;
+}
+Restraints::Angle retag(const Restraints::Angle& src, int new_comp,
+                        const std::string& a1, const std::string& a2,
+                        const std::string& a3) {
+  Restraints::Angle out = src;
+  out.id1 = {new_comp, a1};
+  out.id2 = {new_comp, a2};
+  out.id3 = {new_comp, a3};
+  return out;
+}
+Restraints::Torsion retag(const Restraints::Torsion& src, int new_comp,
+                          const std::string& a1, const std::string& a2,
+                          const std::string& a3, const std::string& a4) {
+  Restraints::Torsion out = src;
+  out.id1 = {new_comp, a1};
+  out.id2 = {new_comp, a2};
+  out.id3 = {new_comp, a3};
+  out.id4 = {new_comp, a4};
+  return out;
+}
+Restraints::Chirality retag(const Restraints::Chirality& src, int new_comp,
+                            const std::string& ac, const std::string& a1,
+                            const std::string& a2, const std::string& a3) {
+  Restraints::Chirality out = src;
+  out.id_ctr = {new_comp, ac};
+  out.id1 = {new_comp, a1};
+  out.id2 = {new_comp, a2};
+  out.id3 = {new_comp, a3};
+  return out;
+}
+
+// True iff two bonds differ enough to warrant a 'change' mod row.
+// We compare the electron-cloud value/sigma only — value_nucleus is a
+// derived quantity that tends to drift cosmetically across pipeline runs.
+bool bond_value_changed(const Restraints::Bond& a, const Restraints::Bond& b) {
+  return std::abs(a.value - b.value) > kBondValueTol ||
+         std::abs(a.esd   - b.esd)   > kBondEsdTol ||
+         a.type != b.type;
+}
+bool angle_value_changed(const Restraints::Angle& a, const Restraints::Angle& b) {
+  return std::abs(a.value - b.value) > kAngleValueTol ||
+         std::abs(a.esd   - b.esd)   > kAngleEsdTol;
+}
+bool torsion_value_changed(const Restraints::Torsion& a, const Restraints::Torsion& b) {
+  // Torsions are circular; treat 180 and -180 as the same. Allow esd/period
+  // changes to trigger a mod though.
+  double diff = std::abs(a.value - b.value);
+  while (diff > 360.0) diff -= 360.0;
+  if (diff > 180.0) diff = 360.0 - diff;
+  return diff > 0.5 || std::abs(a.esd - b.esd) > 0.5 || a.period != b.period;
+}
+
+// Look-up bond / angle / torsion in a parent ChemComp's rt by atom names
+// (order-insensitive for bonds, central-atom-fixed for angles, edge-fixed
+// for torsions). Returns nullptr if absent.
+const Restraints::Bond* find_bond(const Restraints& rt,
+                                  const std::string& a, const std::string& b) {
+  for (const auto& x : rt.bonds)
+    if ((x.id1.atom == a && x.id2.atom == b) ||
+        (x.id1.atom == b && x.id2.atom == a))
+      return &x;
+  return nullptr;
+}
+const Restraints::Angle* find_angle(const Restraints& rt,
+                                    const std::string& a, const std::string& b,
+                                    const std::string& c) {
+  // Central atom is b; outers are unordered.
+  for (const auto& x : rt.angles)
+    if (x.id2.atom == b &&
+        ((x.id1.atom == a && x.id3.atom == c) ||
+         (x.id1.atom == c && x.id3.atom == a)))
+      return &x;
+  return nullptr;
+}
+const Restraints::Torsion* find_torsion(const Restraints& rt,
+                                        const std::string& a, const std::string& b,
+                                        const std::string& c, const std::string& d) {
+  // Edge bc is fixed; (a,d) may be reversed direction.
+  for (const auto& x : rt.torsions) {
+    if (x.id2.atom == b && x.id3.atom == c &&
+        x.id1.atom == a && x.id4.atom == d) return &x;
+    if (x.id2.atom == c && x.id3.atom == b &&
+        x.id1.atom == d && x.id4.atom == a) return &x;
+  }
+  return nullptr;
+}
+const Restraints::Chirality* find_chir(const Restraints& rt,
+                                       const std::string& ctr,
+                                       const std::string& a,
+                                       const std::string& b,
+                                       const std::string& c) {
+  // Centre fixed; the three substituents may appear in any order.
+  std::set<std::string> want{a, b, c};
+  for (const auto& x : rt.chirs)
+    if (x.id_ctr.atom == ctr &&
+        std::set<std::string>{x.id1.atom, x.id2.atom, x.id3.atom} == want)
+      return &x;
+  return nullptr;
+}
+
+// Sides of every atom in a restraint, returned as a pair (set_of_sides, all_atom_names).
+struct Membership {
+  std::set<int> sides;        // 1, 2, or {1, 2}
+  bool all_same() const { return sides.size() == 1; }
+  int  single_side() const { return *sides.begin(); }
+};
+Membership classify_membership(std::initializer_list<std::string> joined_ids) {
+  Membership m;
+  for (const auto& jid : joined_ids) {
+    auto s = split_joined_atom_id(jid);
+    m.sides.insert(s.first);
+  }
+  return m;
+}
+
+// Emit one bond row in the right sink. Returns true if a row was added,
+// so callers can track which monomer entries got 'change' vs 'unchanged'.
+void dispatch_bond(const Restraints::Bond& jb,
+                   const ChemComp& cc1, const ChemComp& cc2,
+                   LinkGenerationResult& out) {
+  auto s1 = split_joined_atom_id(jb.id1.atom);
+  auto s2 = split_joined_atom_id(jb.id2.atom);
+  if (s1.first == s2.first && s1.first != 0) {
+    int side = s1.first;
+    const ChemComp& parent = (side == 1) ? cc1 : cc2;
+    ChemMod& mod = (side == 1) ? out.mod1 : out.mod2;
+    const Restraints::Bond* orig = find_bond(parent.rt, s1.second, s2.second);
+    if (!orig)
+      mod.rt.bonds.push_back(retag(jb, kMod_Add, s1.second, s2.second));
+    else if (bond_value_changed(*orig, jb))
+      mod.rt.bonds.push_back(retag(jb, kMod_Change, s1.second, s2.second));
+  } else {
+    Restraints::Bond linkrow = jb;
+    linkrow.id1 = {s1.first, s1.second};
+    linkrow.id2 = {s2.first, s2.second};
+    out.link.rt.bonds.push_back(linkrow);
+  }
+}
+
+void dispatch_angle(const Restraints::Angle& ja,
+                    const ChemComp& cc1, const ChemComp& cc2,
+                    LinkGenerationResult& out) {
+  auto s1 = split_joined_atom_id(ja.id1.atom);
+  auto s2 = split_joined_atom_id(ja.id2.atom);
+  auto s3 = split_joined_atom_id(ja.id3.atom);
+  Membership m = classify_membership({ja.id1.atom, ja.id2.atom, ja.id3.atom});
+  if (m.all_same()) {
+    int side = m.single_side();
+    const ChemComp& parent = (side == 1) ? cc1 : cc2;
+    ChemMod& mod = (side == 1) ? out.mod1 : out.mod2;
+    const Restraints::Angle* orig =
+        find_angle(parent.rt, s1.second, s2.second, s3.second);
+    if (!orig)
+      mod.rt.angles.push_back(retag(ja, kMod_Add, s1.second, s2.second, s3.second));
+    else if (angle_value_changed(*orig, ja))
+      mod.rt.angles.push_back(retag(ja, kMod_Change, s1.second, s2.second, s3.second));
+  } else {
+    Restraints::Angle linkrow = ja;
+    linkrow.id1 = {s1.first, s1.second};
+    linkrow.id2 = {s2.first, s2.second};
+    linkrow.id3 = {s3.first, s3.second};
+    out.link.rt.angles.push_back(linkrow);
+  }
+}
+
+void dispatch_torsion(const Restraints::Torsion& jt,
+                      const ChemComp& cc1, const ChemComp& cc2,
+                      LinkGenerationResult& out) {
+  auto s1 = split_joined_atom_id(jt.id1.atom);
+  auto s2 = split_joined_atom_id(jt.id2.atom);
+  auto s3 = split_joined_atom_id(jt.id3.atom);
+  auto s4 = split_joined_atom_id(jt.id4.atom);
+  Membership m = classify_membership(
+      {jt.id1.atom, jt.id2.atom, jt.id3.atom, jt.id4.atom});
+  if (m.all_same()) {
+    int side = m.single_side();
+    const ChemComp& parent = (side == 1) ? cc1 : cc2;
+    ChemMod& mod = (side == 1) ? out.mod1 : out.mod2;
+    const Restraints::Torsion* orig = find_torsion(
+        parent.rt, s1.second, s2.second, s3.second, s4.second);
+    if (!orig)
+      mod.rt.torsions.push_back(
+          retag(jt, kMod_Add, s1.second, s2.second, s3.second, s4.second));
+    else if (torsion_value_changed(*orig, jt))
+      mod.rt.torsions.push_back(
+          retag(jt, kMod_Change, s1.second, s2.second, s3.second, s4.second));
+  } else {
+    Restraints::Torsion linkrow = jt;
+    linkrow.id1 = {s1.first, s1.second};
+    linkrow.id2 = {s2.first, s2.second};
+    linkrow.id3 = {s3.first, s3.second};
+    linkrow.id4 = {s4.first, s4.second};
+    out.link.rt.torsions.push_back(linkrow);
+  }
+}
+
+void dispatch_chirality(const Restraints::Chirality& jc,
+                        const ChemComp& cc1, const ChemComp& cc2,
+                        LinkGenerationResult& out) {
+  auto sc = split_joined_atom_id(jc.id_ctr.atom);
+  auto s1 = split_joined_atom_id(jc.id1.atom);
+  auto s2 = split_joined_atom_id(jc.id2.atom);
+  auto s3 = split_joined_atom_id(jc.id3.atom);
+  Membership m = classify_membership(
+      {jc.id_ctr.atom, jc.id1.atom, jc.id2.atom, jc.id3.atom});
+  if (m.all_same()) {
+    int side = m.single_side();
+    const ChemComp& parent = (side == 1) ? cc1 : cc2;
+    ChemMod& mod = (side == 1) ? out.mod1 : out.mod2;
+    const Restraints::Chirality* orig = find_chir(
+        parent.rt, sc.second, s1.second, s2.second, s3.second);
+    if (!orig || orig->sign != jc.sign)
+      mod.rt.chirs.push_back(retag(jc, orig ? kMod_Change : kMod_Add,
+                                   sc.second, s1.second, s2.second, s3.second));
+  } else {
+    Restraints::Chirality linkrow = jc;
+    linkrow.id_ctr = {sc.first, sc.second};
+    linkrow.id1 = {s1.first, s1.second};
+    linkrow.id2 = {s2.first, s2.second};
+    linkrow.id3 = {s3.first, s3.second};
+    out.link.rt.chirs.push_back(linkrow);
+  }
+}
+
+// Planes are special: each plane is a *set* of atoms, possibly spanning sides.
+// We compare by atom set (not by label) — the joined-graph pipeline may
+// label a plane differently from how the standalone monomer labelled the
+// same chemistry (e.g. LYS's carboxylate plane comes back labelled "plan-2"
+// rather than its original "plan-1").
+void dispatch_plane(const Restraints::Plane& jp,
+                    const ChemComp& cc1, const ChemComp& cc2,
+                    LinkGenerationResult& out) {
+  std::set<int> sides;
+  for (const auto& a : jp.ids)
+    sides.insert(split_joined_atom_id(a.atom).first);
+  if (sides.size() == 1) {
+    int side = *sides.begin();
+    const ChemComp& parent = (side == 1) ? cc1 : cc2;
+    ChemMod& mod = (side == 1) ? out.mod1 : out.mod2;
+    // Collect this plane's atom set (unprefixed names).
+    std::set<std::string> jp_atoms;
+    for (const auto& a : jp.ids)
+      jp_atoms.insert(split_joined_atom_id(a.atom).second);
+    // Look for a parent plane whose atom set matches (set equality).
+    const Restraints::Plane* orig = nullptr;
+    for (const auto& p : parent.rt.planes) {
+      std::set<std::string> p_atoms;
+      for (const auto& a : p.ids) p_atoms.insert(a.atom);
+      if (p_atoms == jp_atoms) { orig = &p; break; }
+    }
+    if (orig) {
+      // Same plane already in the monomer. Only emit a 'change' if the
+      // dist_esd differs noticeably. Tolerance matches kBondEsdTol.
+      if (std::abs(orig->esd - jp.esd) > kBondEsdTol) {
+        Restraints::Plane out_plane;
+        out_plane.label = orig->label;
+        out_plane.esd = jp.esd;
+        for (const auto& a : jp.ids)
+          out_plane.ids.push_back(
+              {kMod_Change, split_joined_atom_id(a.atom).second});
+        mod.rt.planes.push_back(out_plane);
+      }
+      return;
+    }
+    // New plane introduced by the link's re-typing.
+    Restraints::Plane out_plane;
+    out_plane.label = jp.label;
+    out_plane.esd = jp.esd;
+    for (const auto& a : jp.ids)
+      out_plane.ids.push_back({kMod_Add, split_joined_atom_id(a.atom).second});
+    mod.rt.planes.push_back(out_plane);
+  } else {
+    Restraints::Plane linkrow;
+    linkrow.label = jp.label;
+    linkrow.esd = jp.esd;
+    for (const auto& a : jp.ids) {
+      auto s = split_joined_atom_id(a.atom);
+      linkrow.ids.push_back({s.first, s.second});
+    }
+    out.link.rt.planes.push_back(linkrow);
+  }
+}
+
+// Emit 'delete' mod rows for every cc-side restraint that references an atom
+// no longer in the joined CC (i.e. a deleted-by-user or auto-deleted atom).
+void emit_delete_rows(const ChemComp& parent_cc, int side,
+                      const std::set<std::string>& deleted_atoms,
+                      ChemMod& mod) {
+  auto touches = [&](const Restraints::AtomId& a) {
+    return deleted_atoms.count(a.atom) != 0;
+  };
+  for (const auto& b : parent_cc.rt.bonds)
+    if (touches(b.id1) || touches(b.id2))
+      mod.rt.bonds.push_back(retag(b, kMod_Delete, b.id1.atom, b.id2.atom));
+  for (const auto& a : parent_cc.rt.angles)
+    if (touches(a.id1) || touches(a.id2) || touches(a.id3))
+      mod.rt.angles.push_back(retag(a, kMod_Delete,
+                                    a.id1.atom, a.id2.atom, a.id3.atom));
+  for (const auto& t : parent_cc.rt.torsions)
+    if (touches(t.id1) || touches(t.id2) || touches(t.id3) || touches(t.id4))
+      mod.rt.torsions.push_back(retag(t, kMod_Delete,
+                                      t.id1.atom, t.id2.atom,
+                                      t.id3.atom, t.id4.atom));
+  for (const auto& c : parent_cc.rt.chirs)
+    if (touches(c.id_ctr) || touches(c.id1) || touches(c.id2) || touches(c.id3))
+      mod.rt.chirs.push_back(retag(c, kMod_Delete,
+                                   c.id_ctr.atom, c.id1.atom,
+                                   c.id2.atom, c.id3.atom));
+  // For planes: if a plane has at least one atom that got deleted, emit a
+  // 'delete'-plane row with just the deleted atoms listed (AceDRG style).
+  for (const auto& p : parent_cc.rt.planes) {
+    Restraints::Plane delp;
+    delp.label = p.label;
+    delp.esd = p.esd;
+    for (const auto& a : p.ids)
+      if (touches(a))
+        delp.ids.push_back({kMod_Delete, a.atom});
+    if (!delp.ids.empty())
+      mod.rt.planes.push_back(delp);
+  }
+  // Mark the deleted atoms themselves in atom_mods.
+  for (const auto& aid : deleted_atoms) {
+    auto src = parent_cc.find_atom(aid);
+    ChemMod::AtomMod am{
+        kMod_Delete, aid, "", Element(El::X), 0.0f, ""};
+    if (src != parent_cc.atoms.end()) {
+      am.el = src->el;
+      am.charge = src->charge;
+      am.chem_type = src->chem_type;
+    }
+    mod.atom_mods.push_back(am);
+  }
+  (void)side;
+}
+
+}  // anonymous namespace
+
+// ─── prepare_chemlink ────────────────────────────────────────────────────────
+
+LinkGenerationResult prepare_chemlink(const ChemComp& cc1, const ChemComp& cc2,
+                                      const LinkSpec& spec,
+                                      const AcedrgTables& tables) {
+  // 1. Build joined skeleton (auto-H done, link bond inserted).
+  ChemComp joined = make_joined_chemcomp(cc1, cc2, spec);
+
+  // 2. Run the AceDRG monomer pipeline over the joined graph to fill in
+  //    bond/angle values, derive torsions/chirs/planes, assign types.
+  PrepareChemcompOptions opts;
+  prepare_chemcomp(joined, tables, opts);
+
+  // 3. Compute deleted-atom sets per side by name-set difference.
+  std::set<std::string> deleted_side1, deleted_side2;
+  for (const auto& a : cc1.atoms)
+    if (joined.find_atom(make_joined_atom_id(1, a.id)) == joined.atoms.end())
+      deleted_side1.insert(a.id);
+  for (const auto& a : cc2.atoms)
+    if (joined.find_atom(make_joined_atom_id(2, a.id)) == joined.atoms.end())
+      deleted_side2.insert(a.id);
+
+  // 4. Initialise the output containers.
+  LinkGenerationResult out;
+  out.link.id = spec.id;
+  out.link.name = spec.id;
+  out.link.side1.comp = cc1.name;
+  out.link.side1.mod  = cc1.name + "m1";
+  out.link.side1.group = cc1.group;
+  out.link.side2.comp = cc2.name;
+  out.link.side2.mod  = cc2.name + "m1";
+  out.link.side2.group = cc2.group;
+  out.mod1.id = cc1.name + "m1";
+  out.mod1.name = cc1.name;
+  out.mod1.comp_id = cc1.name;
+  out.mod1.group_id = ChemComp::group_str(cc1.group);
+  out.mod2.id = cc2.name + "m1";
+  out.mod2.name = cc2.name;
+  out.mod2.comp_id = cc2.name;
+  out.mod2.group_id = ChemComp::group_str(cc2.group);
+
+  // 5. Dispatch every derived restraint to one of the three sinks.
+  for (const auto& b : joined.rt.bonds)   dispatch_bond(b, cc1, cc2, out);
+  for (const auto& a : joined.rt.angles)  dispatch_angle(a, cc1, cc2, out);
+  for (const auto& t : joined.rt.torsions) dispatch_torsion(t, cc1, cc2, out);
+  for (const auto& c : joined.rt.chirs)   dispatch_chirality(c, cc1, cc2, out);
+  for (const auto& p : joined.rt.planes)  dispatch_plane(p, cc1, cc2, out);
+
+  // 6. Emit 'delete' rows for every parent restraint touching a deleted atom.
+  emit_delete_rows(cc1, 1, deleted_side1, out.mod1);
+  emit_delete_rows(cc2, 2, deleted_side2, out.mod2);
+
+  return out;
 }
 
 }  // namespace gemmi
