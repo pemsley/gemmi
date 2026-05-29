@@ -121,6 +121,7 @@ gemmi::LinkSpec parse_link_instruction(const std::string& spec) {
       else if (bt == "TRIPLE")   out.bond_type = gemmi::BondType::Triple;
       else if (bt == "AROMATIC") out.bond_type = gemmi::BondType::Aromatic;
       else if (bt == "DELOC")    out.bond_type = gemmi::BondType::Deloc;
+      else if (bt == "METAL")    out.bond_type = gemmi::BondType::Metal;
       else
         throw std::runtime_error("link spec: unrecognised BOND-TYPE '" + bt + "'");
     }

@@ -943,15 +943,19 @@ void write_link_dictionary(const ChemComp& cc1, const ChemComp& cc2,
   write_mod_list(doc, res);
   write_link_list(doc, res);
 
-  // Full monomer dictionaries.
+  // Full monomer dictionaries. When both sides are the same component
+  // (e.g. disulfide CYS-CYS), emit a single comp block.
   cif::Block& blk_cc1 = doc.add_new_block("comp_" + cc1.name);
   add_chemcomp_to_block(cc1, blk_cc1);
-  cif::Block& blk_cc2 = doc.add_new_block("comp_" + cc2.name);
-  add_chemcomp_to_block(cc2, blk_cc2);
+  if (cc2.name != cc1.name) {
+    cif::Block& blk_cc2 = doc.add_new_block("comp_" + cc2.name);
+    add_chemcomp_to_block(cc2, blk_cc2);
+  }
 
-  // Mod blocks.
+  // Mod blocks. Same deal: a symmetric self-self link uses one mod id.
   write_mod_block(doc, res.mod1);
-  write_mod_block(doc, res.mod2);
+  if (res.mod2.id != res.mod1.id)
+    write_mod_block(doc, res.mod2);
 
   // Link block.
   write_link_block(doc, res.link);

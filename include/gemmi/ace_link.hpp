@@ -73,6 +73,14 @@ GEMMI_DLL std::pair<int, std::string> split_joined_atom_id(
 ///
 /// On contract violation (over-valence, orphan atom, unresolvable charge)
 /// this throws std::runtime_error with a diagnostic naming the bad atom.
+///
+/// Note on BondType::Metal: the auto-H rule sums bond orders to compute
+/// each affected atom's hydrogen complement. Metal-coordination bonds
+/// contribute 0 to that sum, so e.g. `ZN-CYS` with BOND-TYPE METAL leaves
+/// the cysteine HG in place (S valence = 1, target_H = 1). If you want
+/// the thiolate (deprotonated) form, pass BOND-TYPE SINGLE, or list HG
+/// in `spec.deletions` explicitly. This mirrors AceDRG's behaviour: the
+/// link spec is prescriptive about chemistry.
 GEMMI_DLL ChemComp make_joined_chemcomp(const ChemComp& cc1,
                                         const ChemComp& cc2,
                                         const LinkSpec& spec);
