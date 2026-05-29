@@ -166,6 +166,16 @@ endif()
 if (NOT DEFINED SKBUILD AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   find_package(benchmark 1.3 QUIET)
 endif()
+
+# SQLite3 — used by the AceDRG-tables on-demand lookup backend
+# (src/acedrg_tables_db.cpp). Optional: if not found, the in-memory and
+# binary-cache paths still work.
+find_package(SQLite3 QUIET)
+if (SQLite3_FOUND)
+  message(STATUS "Found SQLite3: ${SQLite3_LIBRARIES}")
+else()
+  message(STATUS "SQLite3 not found — gemmi drg --tables=*.sqlite path will be unavailable.")
+endif()
 if (benchmark_FOUND)
   message(STATUS "Found benchmark: ${benchmark_DIR}")
 else (NOT benchmark_FOUND)
@@ -212,7 +222,7 @@ target_compile_features(gemmi_headers INTERFACE cxx_std_14)
 set_target_properties(gemmi_headers PROPERTIES EXPORT_NAME headers)
 
 add_library(gemmi_cpp
-            src/ace_cc.cpp src/ace_carborane.cpp src/ace_link.cpp src/chemcomp.cpp src/chemcomp_xyz.cpp src/cc_adj.cpp src/ace_graph.cpp src/acedrg_tables.cpp src/acedrg_tables_bin.cpp src/ccp4ener.cpp src/align.cpp src/assembly.cpp src/calculate.cpp src/ccp4.cpp
+            src/ace_cc.cpp src/ace_carborane.cpp src/ace_link.cpp src/chemcomp.cpp src/chemcomp_xyz.cpp src/cc_adj.cpp src/ace_graph.cpp src/acedrg_tables.cpp src/acedrg_tables_bin.cpp src/acedrg_tables_db.cpp src/ccp4ener.cpp src/align.cpp src/assembly.cpp src/calculate.cpp src/ccp4.cpp
             src/crd.cpp src/ddl.cpp src/eig3.cpp src/flat.cpp src/fprime.cpp src/gz.cpp
             src/intensit.cpp src/json.cpp src/mmcif.cpp src/mmread_gz.cpp
             src/monlib.cpp src/ener_lib.cpp src/mtz.cpp src/mtz2cif.cpp
@@ -235,6 +245,11 @@ if (BUILD_SHARED_LIBS)
   endif()
 endif()
 target_link_libraries(gemmi_cpp PUBLIC gemmi_headers)
+
+if (SQLite3_FOUND)
+  target_compile_definitions(gemmi_cpp PRIVATE GEMMI_HAS_SQLITE3=1)
+  target_link_libraries(gemmi_cpp PRIVATE SQLite3::SQLite3)
+endif()
 
 if (FETCH_ZLIB_NG)
   target_compile_definitions(gemmi_cpp PRIVATE USE_ZLIB_NG=1)

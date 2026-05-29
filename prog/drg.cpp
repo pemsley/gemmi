@@ -25,7 +25,7 @@ namespace {
 
 enum OptionIndex {
   Tables=4, Sigma, Timing, CifStyle, OutputDir, NoAngles, CoordModel, OnlyXyz,
-  LinkSpecOpt, BuildTableCache
+  LinkSpecOpt, BuildTableCache, BuildTableDb
 };
 
 const option::Descriptor Usage[] = {
@@ -59,6 +59,11 @@ const option::Descriptor Usage[] = {
     "\n\t\txyz | example | ideal | first | auto (default: auto)." },
   { OnlyXyz, 0, "", "only-xyz", Arg::None,
     "  --only-xyz  \tDo not fill restraints; only generate/update ideal coordinates." },
+  { BuildTableDb, 0, "", "build-table-db", Arg::Required,
+    "  --build-table-db=OUT.sqlite  \tConvert the ASCII AceDRG tables under"
+    "\n\t\t--tables=DIR (or ACEDRG_TABLES / $CCP4/share/acedrg/tables) into"
+    "\n\t\ta single SQLite database at OUT.sqlite, then exits. The DB is"
+    "\n\t\tused by gemmi drg's on-demand lookup backend (no upfront load)." },
   { BuildTableCache, 0, "", "build-table-cache", Arg::None,
     "  --build-table-cache  \tLoad the ASCII AceDRG tables from --tables=DIR"
     "\n\t\t(or ACEDRG_TABLES / $CCP4/share/acedrg/tables) and write a binary"
@@ -517,6 +522,32 @@ std::map<std::string, Position> load_companion_mol0_coords(
 int GEMMI_MAIN(int argc, char **argv) {
   OptParser p(EXE_NAME);
   p.simple_parse(argc, argv, Usage);
+
+  // ── --build-table-db: convert ASCII tables to a single SQLite file ────
+  if (p.options[BuildTableDb]) {
+    std::string tables_dir;
+    if (p.options[Tables]) tables_dir = p.options[Tables].arg;
+    else if (const char* env = std::getenv("ACEDRG_TABLES")) tables_dir = env;
+    else if (const char* ccp4 = std::getenv("CCP4"))
+      tables_dir = std::string(ccp4) + "/share/acedrg/tables";
+    if (tables_dir.empty()) {
+      std::fprintf(stderr,
+          "ERROR: --build-table-db needs --tables=DIR, ACEDRG_TABLES, or CCP4.\n");
+      return 1;
+    }
+    std::string out_path = p.options[BuildTableDb].arg;
+    try {
+      Timer t(true);
+      t.start();
+      gemmi::build_acedrg_sqlite(tables_dir, out_path);
+      t.print("SQLite tables written in");
+      std::fprintf(stderr, "Wrote %s\n", out_path.c_str());
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "ERROR: %s\n", e.what());
+      return 1;
+    }
+    return 0;
+  }
 
   // ── --build-table-cache: load ASCII tables, write binary cache, exit ──
   if (p.options[BuildTableCache]) {

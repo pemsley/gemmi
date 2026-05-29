@@ -413,6 +413,14 @@ struct GEMMI_DLL AcedrgTables {
   }
 };
 
+/// Convert the ASCII AceDRG tables under `tables_dir` into a single
+/// SQLite file at `sqlite_path`. One-shot prep step; the resulting file
+/// is then used by the on-demand DB-backed lookup backend instead of the
+/// ~1 GB in-memory load. Throws std::runtime_error on I/O failure or if
+/// gemmi was built without libsqlite3 support.
+GEMMI_DLL bool build_acedrg_sqlite(const std::string& tables_dir,
+                                   const std::string& sqlite_path);
+
 } // namespace gemmi
 
 #endif
