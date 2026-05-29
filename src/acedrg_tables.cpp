@@ -788,6 +788,25 @@ void AcedrgTables::load_bond_tables(const std::string& dir) {
   std::set<int> loaded_files;
   int n_files = 0, n_lines = 0;
 
+  // Reusable buffers to avoid per-line std::string allocations for keys
+  // and atom-type-code lookups.
+  std::string key_buf;          // compound key (key_4 / key_8 / key_10)
+  std::string code_buf;         // atom-code lookup key
+  std::string hybr_buf;         // ha1|ha2|hybr (side set key)
+  key_buf.reserve(512);
+  code_buf.reserve(64);
+  hybr_buf.reserve(64);
+
+  // Reserve outer hash maps to avoid rehashing. Sized from the ~360k bond
+  // rows observed empirically (most share a key_4 prefix, so unique key_8
+  // counts cluster around 100-200k).
+  bond_idx_1d_.reserve(200'000);
+  bond_idx_full_.reserve(200'000);
+  bond_idx_2d_.reserve(20'000);
+  bond_hasp_2d_.reserve(20'000);
+  bond_2d_hybr_keys_.reserve(20'000);
+  bond_full_4prefix_keys_.reserve(20'000);
+
   for (const auto& fi_kv : bond_file_index_) {
     {
       int file_num = fi_kv.second;
@@ -831,9 +850,12 @@ void AcedrgTables::load_bond_tables(const std::string& dir) {
         int count2 = simple_atoi(p, &p);
 
         ++n_lines;
-        // Get atom types from codes: full, main (before '{'), root (before '(')
-        auto* p1 = find_val(atom_type_codes_, std::string(code1_s, code1_e));
-        auto* p2 = find_val(atom_type_codes_, std::string(code2_s, code2_e));
+        // Get atom types from codes: full, main (before '{').
+        // Reuse code_buf so the lookup-key allocation only grows once.
+        code_buf.assign(code1_s, code1_e - code1_s);
+        auto* p1 = find_val(atom_type_codes_, code_buf);
+        code_buf.assign(code2_s, code2_e - code2_s);
+        auto* p2 = find_val(atom_type_codes_, code_buf);
         std::string a1_type_f = p1 ? *p1 : std::string();
         std::string a2_type_f = p2 ? *p2 : std::string();
         std::string a1_type_m = prefix_before(a1_type_f, '{');
@@ -841,23 +863,35 @@ void AcedrgTables::load_bond_tables(const std::string& dir) {
         CodStats vs(value, sigma, count);
         CodStats vs1d(value2, sigma2, count2);
 
-        // Construct compound keys for flat lookup structures
-        auto key_4 = cat(ha1, '|', ha2, '|', hybr_comb, '|', in_ring);
-        auto key_8 = cat(key_4, '|', a1_nb2, '|', a2_nb2, '|', a1_nb, '|', a2_nb);
+        // Construct compound keys for flat lookup structures.
+        // Build key_4 first into key_buf, remember its length so we can
+        // re-extend in place when building key_8 (no realloc).
+        key_buf.clear();
+        cat_to(key_buf, ha1, '|', ha2, '|', hybr_comb, '|', in_ring);
+        const size_t key_4_len = key_buf.size();
+        cat_to(key_buf, '|', a1_nb2, '|', a2_nb2, '|', a1_nb, '|', a2_nb);
 
-        // Populate 1D structure (8-component key + 2 inner type levels)
-        bond_idx_1d_[key_8][a1_type_m][a2_type_m].push_back(vs1d);
+        // Populate 1D structure (8-component key + 2 inner type levels).
+        bond_idx_1d_[key_buf][a1_type_m][a2_type_m].push_back(vs1d);
 
-        // Store full COD-class stats for exact matches
+        // Store full COD-class stats for exact matches.
         if (!a1_type_f.empty() && !a2_type_f.empty()) {
-          auto key_10 = cat(key_8, '|', a1_type_m, '|', a2_type_m);
-          bond_idx_full_[key_10][a1_type_f][a2_type_f] = vs;
-          bond_full_4prefix_keys_.insert(key_4);
+          cat_to(key_buf, '|', a1_type_m, '|', a2_type_m);
+          bond_idx_full_[key_buf][a1_type_f][a2_type_f] = vs;
+          // bond_full_4prefix_keys_ wants only the 4-component prefix.
+          key_buf.resize(key_4_len);
+          bond_full_4prefix_keys_.insert(key_buf);
+        } else {
+          key_buf.resize(key_4_len);
         }
 
-        // Populate 2D structure (4-component key + 4 inner levels)
-        bond_idx_2d_[key_4][a1_nb2][a2_nb2][a1_nb][a2_nb].push_back(vs);
-        bond_2d_hybr_keys_.insert(cat(ha1, '|', ha2, '|', hybr_comb));
+        // Populate 2D structure (4-component key + 4 inner levels).
+        bond_idx_2d_[key_buf][a1_nb2][a2_nb2][a1_nb][a2_nb].push_back(vs);
+
+        // bond_2d_hybr_keys_ wants the 3-component key (ha1|ha2|hybr).
+        hybr_buf.clear();
+        cat_to(hybr_buf, ha1, '|', ha2, '|', hybr_comb);
+        bond_2d_hybr_keys_.insert(hybr_buf);
 
         // Levels 9-11 are populated from allOrgBondsHRS.table in load_bond_hrs().
       }
@@ -871,6 +905,20 @@ void AcedrgTables::load_angle_tables(const std::string& dir) {
   // Load all numbered angle table files from allOrgAngleTables.
   // We intentionally ignore angle_idx.table and read full angle statistics.
   int n_files = 0, n_lines = 0;
+
+  // Reuse buffers across all ~2M angle rows so we don't reallocate the
+  // compound-key string each iteration.
+  std::string key_buf;
+  std::string code_buf;
+  key_buf.reserve(1024);
+  code_buf.reserve(64);
+
+  // Reserve the four flat angle indices. Empirical counts from the CCP4
+  // tables: ~1.5M unique 1D keys, ~800k 2D, ~150k 3D, ~30k 4D.
+  angle_idx_1d_.reserve(1'500'000);
+  angle_idx_2d_.reserve(800'000);
+  angle_idx_3d_.reserve(150'000);
+  angle_idx_4d_.reserve(30'000);
 
   for (int file_num : list_numeric_table_ids(dir)) {
     std::string path = cat(dir, '/', file_num, ".table");
@@ -926,36 +974,58 @@ void AcedrgTables::load_angle_tables(const std::string& dir) {
       }
 
       ++n_lines;
-      // Get main atom types (before '{') from codes
-      auto* q1 = find_val(atom_type_codes_, std::string(code1_s, code1_e));
-      auto* q2 = find_val(atom_type_codes_, std::string(code2_s, code2_e));
-      auto* q3 = find_val(atom_type_codes_, std::string(code3_s, code3_e));
+      // Get main atom types (before '{') from codes. Reuse code_buf to
+      // avoid three temporary std::string allocations per row.
+      code_buf.assign(code1_s, code1_e - code1_s);
+      auto* q1 = find_val(atom_type_codes_, code_buf);
+      code_buf.assign(code2_s, code2_e - code2_s);
+      auto* q2 = find_val(atom_type_codes_, code_buf);
+      code_buf.assign(code3_s, code3_e - code3_s);
+      auto* q3 = find_val(atom_type_codes_, code_buf);
       std::string a1_type = q1 ? prefix_before(*q1, '{') : std::string();
       std::string a2_type = q2 ? prefix_before(*q2, '{') : std::string();
       std::string a3_type = q3 ? prefix_before(*q3, '{') : std::string();
 
-      // Populate structures at each level with corresponding pre-computed values.
-      // AceDRG keeps only the first entry for each key (no aggregation).
-      // Levels 1D-4D: flat string keys with decreasing specificity.
-      std::string base_key = cat(ha1, '|', ha2, '|', ha3, '|', value_key, '|',
-                                 a1_root, '|', a2_root, '|', a3_root);
-      std::string keys[4] = {
-        cat(base_key, '|', a1_nb2, '|', a2_nb2, '|', a3_nb2, '|',
-            a1_nb, '|', a2_nb, '|', a3_nb, '|',
-            a1_type, '|', a2_type, '|', a3_type),
-        cat(base_key, '|', a1_nb2, '|', a2_nb2, '|', a3_nb2, '|',
-            a1_nb, '|', a2_nb, '|', a3_nb),
-        cat(base_key, '|', a1_nb2, '|', a2_nb2, '|', a3_nb2),
-        base_key,
-      };
-      AngleIdx1D* maps[4] = {&angle_idx_1d_, &angle_idx_2d_,
-                              &angle_idx_3d_, &angle_idx_4d_};
-      for (int lvl = 0; lvl < 4; ++lvl) {
-        auto& vec = (*maps[lvl])[keys[lvl]];
+      // Build the four level keys in-place by extending and truncating a
+      // single buffer. 4D (shortest) -> 3D -> 2D -> 1D (longest) keeps
+      // the keys nested so each extension is just an append.
+      // 4D base: ha1|ha2|ha3|value_key|a1_root|a2_root|a3_root
+      key_buf.clear();
+      cat_to(key_buf, ha1, '|', ha2, '|', ha3, '|', value_key, '|',
+             a1_root, '|', a2_root, '|', a3_root);
+      const size_t key_4d_len = key_buf.size();
+
+      auto insert_first = [](AngleIdx1D& m, const std::string& k,
+                             double v, double s, int c) {
+        auto& vec = m[k];
         if (vec.empty())
-          vec.push_back(CodStats(values[lvl + 1], sigmas[lvl + 1], counts[lvl + 1]));
-      }
-      // Level 5D: nested int-keyed map (different structure)
+          vec.push_back(CodStats(v, s, c));
+      };
+
+      // Insert level 4D key (shortest).
+      insert_first(angle_idx_4d_, key_buf,
+                   values[4], sigmas[4], counts[4]);
+
+      // Extend to 3D.
+      cat_to(key_buf, '|', a1_nb2, '|', a2_nb2, '|', a3_nb2);
+      const size_t key_3d_len = key_buf.size();
+      insert_first(angle_idx_3d_, key_buf,
+                   values[3], sigmas[3], counts[3]);
+
+      // Extend to 2D.
+      cat_to(key_buf, '|', a1_nb, '|', a2_nb, '|', a3_nb);
+      const size_t key_2d_len = key_buf.size();
+      insert_first(angle_idx_2d_, key_buf,
+                   values[2], sigmas[2], counts[2]);
+
+      // Extend to 1D (longest).
+      cat_to(key_buf, '|', a1_type, '|', a2_type, '|', a3_type);
+      insert_first(angle_idx_1d_, key_buf,
+                   values[1], sigmas[1], counts[1]);
+
+      (void)key_4d_len; (void)key_3d_len; (void)key_2d_len;
+
+      // Level 5D: nested int-keyed map (different structure).
       auto& angle_5d_vec = angle_idx_5d_[ha1][ha2][ha3][value_key];
       if (angle_5d_vec.empty())
         angle_5d_vec.push_back(CodStats(values[5], sigmas[5], counts[5]));
