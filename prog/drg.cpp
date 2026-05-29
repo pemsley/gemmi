@@ -25,7 +25,7 @@ namespace {
 
 enum OptionIndex {
   Tables=4, Sigma, Timing, CifStyle, OutputDir, NoAngles, CoordModel, OnlyXyz,
-  LinkSpecOpt
+  LinkSpecOpt, BuildTableCache
 };
 
 const option::Descriptor Usage[] = {
@@ -59,6 +59,12 @@ const option::Descriptor Usage[] = {
     "\n\t\txyz | example | ideal | first | auto (default: auto)." },
   { OnlyXyz, 0, "", "only-xyz", Arg::None,
     "  --only-xyz  \tDo not fill restraints; only generate/update ideal coordinates." },
+  { BuildTableCache, 0, "", "build-table-cache", Arg::None,
+    "  --build-table-cache  \tLoad the ASCII AceDRG tables from --tables=DIR"
+    "\n\t\t(or ACEDRG_TABLES / $CCP4/share/acedrg/tables) and write a binary"
+    "\n\t\tcache to DIR/acedrg_cache.bin. Subsequent gemmi drg runs against"
+    "\n\t\tthat directory pick the cache up automatically and load in ~0.3s"
+    "\n\t\tinstead of ~10s. Then exits." },
   { LinkSpecOpt, 0, "", "link", Arg::Required,
     "  --link=SPEC  \tGenerate a chemical link description (one CCP4-style"
     "\n\t\t`_chem_link` + two `_chem_mod` blocks) instead of a monomer dict."
@@ -511,6 +517,40 @@ std::map<std::string, Position> load_companion_mol0_coords(
 int GEMMI_MAIN(int argc, char **argv) {
   OptParser p(EXE_NAME);
   p.simple_parse(argc, argv, Usage);
+
+  // ── --build-table-cache: load ASCII tables, write binary cache, exit ──
+  if (p.options[BuildTableCache]) {
+    std::string tables_dir;
+    if (p.options[Tables]) tables_dir = p.options[Tables].arg;
+    else if (const char* env = std::getenv("ACEDRG_TABLES")) tables_dir = env;
+    else if (const char* ccp4 = std::getenv("CCP4"))
+      tables_dir = std::string(ccp4) + "/share/acedrg/tables";
+    if (tables_dir.empty()) {
+      std::fprintf(stderr,
+          "ERROR: --build-table-cache needs --tables=DIR, ACEDRG_TABLES, or CCP4.\n");
+      return 1;
+    }
+    std::string cache_path = tables_dir + "/acedrg_cache.bin";
+    // If a cache already exists, remove it first so load_tables loads
+    // everything from ASCII (otherwise it'd pick up the stale binary).
+    std::remove(cache_path.c_str());
+    try {
+      Timer t(true);
+      AcedrgTables tables;
+      tables.verbose = p.options[Verbose].count();
+      t.start();
+      tables.load_tables(tables_dir, /*skip_angles=*/false);
+      t.print("ASCII tables loaded in");
+      t.start();
+      tables.save_binary(cache_path);
+      t.print("Binary cache written in");
+      std::fprintf(stderr, "Wrote %s\n", cache_path.c_str());
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "ERROR: %s\n", e.what());
+      return 1;
+    }
+    return 0;
+  }
 
   // ── --link mode: a chemical-link description (mod + link blocks) ──────
   if (p.options[LinkSpecOpt]) {

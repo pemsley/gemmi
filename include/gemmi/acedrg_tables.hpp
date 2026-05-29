@@ -160,6 +160,19 @@ struct GEMMI_DLL AcedrgTables {
   // Load all tables from directory
   void load_tables(const std::string& tables_dir, bool skip_angles = false);
 
+  /// Serialise the loaded heavy tables (bond/angle indices and their side
+  /// sets) to a single binary file. Reading this file with `load_binary`
+  /// replaces the two slow ASCII loaders (~10s -> ~0.3s on CCP4 data).
+  /// The remaining cheap loaders (HRS, metal, energy, atom types, torsion
+  /// tables) still run from ASCII; both ASCII and binary paths can coexist.
+  void save_binary(const std::string& path) const;
+
+  /// Inverse of `save_binary`. The binary file must have been produced
+  /// from the same gemmi binary version (a magic + version word at the
+  /// top of the file is checked). Throws std::runtime_error on
+  /// mismatch or I/O error.
+  void load_binary(const std::string& path);
+
   // Process a ChemComp - fill all missing restraint values
   void fill_restraints(ChemComp& cc) const;
 

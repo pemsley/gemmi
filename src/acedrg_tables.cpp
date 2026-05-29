@@ -388,11 +388,41 @@ void AcedrgTables::load_tables(const std::string& tables_dir, bool skip_angles) 
   lap("load_atom_type_codes");
   load_bond_index(tables_dir + "/allOrgBondTables/bond_idx.table");
   lap("load_bond_index");
-  load_bond_tables(tables_dir + "/allOrgBondTables");
-  lap("load_bond_tables");
-  if (!skip_angles) {
-    load_angle_tables(tables_dir + "/allOrgAngleTables");
-    lap("load_angle_tables");
+
+  // If a binary cache exists alongside the ASCII tables, use it for the
+  // two heavy index loaders. Falls back to ASCII transparently if the
+  // file is missing, malformed, or a version mismatch.
+  std::string bin_path = tables_dir + "/acedrg_cache.bin";
+  bool used_binary = false;
+  if (fileptr_t f = file_open_or_null(bin_path.c_str(), "rb")) {
+    f.reset();  // close it before load_binary reopens
+    try {
+      load_binary(bin_path);
+      used_binary = true;
+      lap("load_binary  (bond+angle indices)");
+    } catch (const std::exception& e) {
+      if (verbose >= 1)
+        std::fprintf(stderr,
+                     "    [warn] %s — falling back to ASCII tables\n",
+                     e.what());
+      // Clear partially-loaded state so the ASCII path starts clean.
+      bond_idx_1d_.clear();    bond_idx_full_.clear();
+      bond_idx_2d_.clear();    bond_hasp_2d_.clear();
+      bond_hasp_1d_.clear();   bond_hasp_0d_.clear();
+      bond_2d_hybr_keys_.clear();
+      bond_full_4prefix_keys_.clear();
+      angle_idx_1d_.clear();   angle_idx_2d_.clear();
+      angle_idx_3d_.clear();   angle_idx_4d_.clear();
+      angle_idx_5d_.clear();   angle_idx_6d_.clear();
+    }
+  }
+  if (!used_binary) {
+    load_bond_tables(tables_dir + "/allOrgBondTables");
+    lap("load_bond_tables");
+    if (!skip_angles) {
+      load_angle_tables(tables_dir + "/allOrgAngleTables");
+      lap("load_angle_tables");
+    }
   }
   load_pep_tors(tables_dir + "/pep_tors.table");
   lap("load_pep_tors");
