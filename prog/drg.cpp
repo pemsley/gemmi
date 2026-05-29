@@ -9,6 +9,7 @@
 #include "gemmi/mmcif.hpp"        // for ChemCompModel, make_residue_from_chemcomp_block
 #include "gemmi/acedrg_tables.hpp"  // for AcedrgTables
 #include "gemmi/ace_cc.hpp"        // for prepare_chemcomp
+#include "gemmi/ace_link.hpp"      // for prepare_chemlink, LinkSpec, write_link_dictionary
 #include "gemmi/to_cif.hpp"       // for write_cif_to_stream
 #include "gemmi/to_chemcomp.hpp"  // for add_chemcomp_to_block
 #include "gemmi/version.hpp"       // for GEMMI_VERSION
@@ -23,7 +24,8 @@ using namespace gemmi;
 namespace {
 
 enum OptionIndex {
-  Tables=4, Sigma, Timing, CifStyle, OutputDir, NoAngles, CoordModel, OnlyXyz
+  Tables=4, Sigma, Timing, CifStyle, OutputDir, NoAngles, CoordModel, OnlyXyz,
+  LinkSpecOpt
 };
 
 const option::Descriptor Usage[] = {
@@ -57,12 +59,142 @@ const option::Descriptor Usage[] = {
     "\n\t\txyz | example | ideal | first | auto (default: auto)." },
   { OnlyXyz, 0, "", "only-xyz", Arg::None,
     "  --only-xyz  \tDo not fill restraints; only generate/update ideal coordinates." },
+  { LinkSpecOpt, 0, "", "link", Arg::Required,
+    "  --link=SPEC  \tGenerate a chemical link description (one CCP4-style"
+    "\n\t\t`_chem_link` + two `_chem_mod` blocks) instead of a monomer dict."
+    "\n\t\tSPEC is the AceDRG-style instruction line, e.g.:"
+    "\n\t\t  \"LINK: RES-NAME-1 LYS ATOM-NAME-1 NZ"
+    "\n\t\t       RES-NAME-2 PLP ATOM-NAME-2 C4A"
+    "\n\t\t       DELETE ATOM O4A 2 BOND-TYPE DOUBLE\""
+    "\n\t\tPositional args are then COMP1.cif COMP2.cif OUTPUT.cif." },
   { 0, 0, 0, 0, 0, 0 }
 };
 
 std::string get_filename(const std::string& path) {
   size_t pos = path.find_last_of("/\\");
   return pos == std::string::npos ? path : path.substr(pos + 1);
+}
+
+// Parse an AceDRG-style link instruction line into a gemmi::LinkSpec.
+// Format (order-tolerant; FILE-1 / FILE-2 are ignored — paths come from
+// positional args):
+//   LINK: RES-NAME-1 <name> ATOM-NAME-1 <atom>
+//         RES-NAME-2 <name> ATOM-NAME-2 <atom>
+//         [DELETE ATOM <atom> <side>]*  [BOND-TYPE <type>]
+gemmi::LinkSpec parse_link_instruction(const std::string& spec) {
+  gemmi::LinkSpec out;
+  std::vector<std::string> toks;
+  std::string cur;
+  for (char c : spec) {
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+      if (!cur.empty()) { toks.push_back(cur); cur.clear(); }
+    } else {
+      cur += c;
+    }
+  }
+  if (!cur.empty()) toks.push_back(cur);
+  // Strip a leading "LINK:" if present.
+  if (!toks.empty() && (toks.front() == "LINK:" || toks.front() == "LINK"))
+    toks.erase(toks.begin());
+
+  auto uppercase = [](std::string s) {
+    for (char& c : s) if (c >= 'a' && c <= 'z') c -= 32;
+    return s;
+  };
+  auto need_next = [&](size_t& i, const char* tag) -> std::string {
+    if (i + 1 >= toks.size())
+      throw std::runtime_error(std::string("link spec: missing value after ") + tag);
+    return toks[++i];
+  };
+
+  for (size_t i = 0; i < toks.size(); ++i) {
+    std::string up = uppercase(toks[i]);
+    if (up == "RES-NAME-1")      out.comp1_name = need_next(i, "RES-NAME-1");
+    else if (up == "RES-NAME-2") out.comp2_name = need_next(i, "RES-NAME-2");
+    else if (up == "ATOM-NAME-1") out.atom1 = need_next(i, "ATOM-NAME-1");
+    else if (up == "ATOM-NAME-2") out.atom2 = need_next(i, "ATOM-NAME-2");
+    else if (up == "FILE-1" || up == "FILE-2") (void)need_next(i, up.c_str());
+    else if (up == "BOND-TYPE") {
+      std::string bt = uppercase(need_next(i, "BOND-TYPE"));
+      if      (bt == "SINGLE")   out.bond_type = gemmi::BondType::Single;
+      else if (bt == "DOUBLE")   out.bond_type = gemmi::BondType::Double;
+      else if (bt == "TRIPLE")   out.bond_type = gemmi::BondType::Triple;
+      else if (bt == "AROMATIC") out.bond_type = gemmi::BondType::Aromatic;
+      else if (bt == "DELOC")    out.bond_type = gemmi::BondType::Deloc;
+      else
+        throw std::runtime_error("link spec: unrecognised BOND-TYPE '" + bt + "'");
+    }
+    else if (up == "DELETE") {
+      // DELETE [ATOM] <atom-name> <side>
+      std::string nxt = uppercase(need_next(i, "DELETE"));
+      if (nxt != "ATOM") {
+        // Tolerate "DELETE <atom> <side>" without the literal ATOM.
+        std::string side_str = need_next(i, "DELETE");
+        int side = std::stoi(side_str);
+        out.deletions.push_back({side, toks[i - 1]});
+      } else {
+        std::string atom = need_next(i, "DELETE ATOM");
+        std::string side_str = need_next(i, "DELETE ATOM <atom>");
+        int side = std::stoi(side_str);
+        out.deletions.push_back({side, atom});
+      }
+    }
+    // Anything else is silently tolerated (AceDRG sometimes includes extras).
+  }
+
+  if (out.comp1_name.empty() || out.comp2_name.empty() ||
+      out.atom1.empty() || out.atom2.empty())
+    throw std::runtime_error(
+        "link spec: missing one of RES-NAME-1/2, ATOM-NAME-1/2");
+  out.id = out.comp1_name + "-" + out.comp2_name;
+  return out;
+}
+
+// Run the link-generation pipeline and write the output cif.
+int run_link_mode(const std::string& spec_text,
+                  const std::string& comp1_path,
+                  const std::string& comp2_path,
+                  const std::string& output_path,
+                  const std::string& tables_dir,
+                  bool no_angles,
+                  int verbose) {
+  gemmi::LinkSpec spec = parse_link_instruction(spec_text);
+
+  auto load_first = [](const std::string& path) -> gemmi::ChemComp {
+    cif::Document doc = read_cif_gz(path);
+    for (cif::Block& block : doc.blocks)
+      if (block.find_values("_chem_comp_atom.atom_id"))
+        return make_chemcomp_from_block(block);
+    throw std::runtime_error("No chem_comp_atom block in " + path);
+  };
+  ChemComp cc1 = load_first(comp1_path);
+  ChemComp cc2 = load_first(comp2_path);
+
+  if (verbose)
+    std::fprintf(stderr,
+                 "Link spec '%s': %s/%s -- %s/%s (%d delete(s))\n",
+                 spec.id.c_str(),
+                 spec.comp1_name.c_str(), spec.atom1.c_str(),
+                 spec.comp2_name.c_str(), spec.atom2.c_str(),
+                 (int) spec.deletions.size());
+
+  AcedrgTables tables;
+  tables.verbose = verbose;
+  tables.load_tables(tables_dir, no_angles);
+
+  gemmi::LinkGenerationResult res =
+      gemmi::prepare_chemlink(cc1, cc2, spec, tables);
+
+  cif::Document out_doc;
+  gemmi::write_link_dictionary(cc1, cc2, res, out_doc, spec_text);
+
+  if (output_path == "-") {
+    gemmi::cif::write_cif_to_stream(std::cout, out_doc);
+  } else {
+    gemmi::Ofstream os(output_path);
+    gemmi::cif::write_cif_to_stream(os.ref(), out_doc);
+  }
+  return 0;
 }
 
 enum class CoordModelChoice { Auto, Xyz, Example, Ideal, First };
@@ -378,6 +510,29 @@ std::map<std::string, Position> load_companion_mol0_coords(
 int GEMMI_MAIN(int argc, char **argv) {
   OptParser p(EXE_NAME);
   p.simple_parse(argc, argv, Usage);
+
+  // ── --link mode: a chemical-link description (mod + link blocks) ──────
+  if (p.options[LinkSpecOpt]) {
+    p.require_positional_args(3);
+    std::string tables_dir;
+    if (p.options[Tables]) tables_dir = p.options[Tables].arg;
+    else if (const char* env = std::getenv("ACEDRG_TABLES")) tables_dir = env;
+    else if (const char* ccp4 = std::getenv("CCP4"))
+      tables_dir = std::string(ccp4) + "/share/acedrg/tables";
+    if (tables_dir.empty()) {
+      std::fprintf(stderr, "ERROR: --link requires --tables, ACEDRG_TABLES, or CCP4 env.\n");
+      return 1;
+    }
+    try {
+      return run_link_mode(p.options[LinkSpecOpt].arg,
+                           p.nonOption(0), p.nonOption(1), p.nonOption(2),
+                           tables_dir, p.options[NoAngles],
+                           p.options[Verbose].count());
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "ERROR: %s\n", e.what());
+      return 1;
+    }
+  }
 
   bool batch_mode = p.options[OutputDir];
   if (batch_mode) {

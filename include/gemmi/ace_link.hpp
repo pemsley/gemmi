@@ -26,6 +26,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "cifdoc.hpp"    // for cif::Document
 #include "chemcomp.hpp"  // for ChemComp, BondType
 #include "monlib.hpp"    // for ChemLink, ChemMod
 
@@ -97,6 +98,20 @@ GEMMI_DLL LinkGenerationResult prepare_chemlink(const ChemComp& cc1,
                                                 const ChemComp& cc2,
                                                 const LinkSpec& spec,
                                                 const AcedrgTables& tables);
+
+/// Serialise the full link dictionary (CCP4 monomer-library format) into
+/// `doc`: data_comp_list, data_mod_list, data_link_list summary blocks
+/// followed by data_comp_<NAME> for each monomer, data_mod_<NAME>m1 for
+/// each mod, and data_link_<id> for the link itself.
+///
+/// `instruction` is copied verbatim into a _CCP4_AceDRG_link_generation
+/// .instruction text field on data_program_info (mirrors AceDRG's audit
+/// trail). Pass an empty string to skip.
+GEMMI_DLL void write_link_dictionary(const ChemComp& cc1,
+                                     const ChemComp& cc2,
+                                     const LinkGenerationResult& res,
+                                     cif::Document& doc,
+                                     const std::string& instruction = "");
 
 } // namespace gemmi
 #endif

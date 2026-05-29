@@ -15,7 +15,10 @@
 #include "gemmi/ace_cc.hpp"          // prepare_chemcomp, PrepareChemcompOptions
 #include "gemmi/ace_graph.hpp"       // expected_valence_for_nonmetal, build_bond_adjacency
 #include "gemmi/acedrg_tables.hpp"   // AcedrgTables
+#include "gemmi/sprintf.hpp"         // to_str
+#include "gemmi/to_chemcomp.hpp"     // add_chemcomp_to_block
 #include "gemmi/util.hpp"            // vector_remove_if
+#include "gemmi/version.hpp"         // GEMMI_VERSION
 
 namespace gemmi {
 
@@ -690,6 +693,268 @@ LinkGenerationResult prepare_chemlink(const ChemComp& cc1, const ChemComp& cc2,
   emit_delete_rows(cc2, 2, deleted_side2, out.mod2);
 
   return out;
+}
+
+// ─── CIF writer: write_link_dictionary ──────────────────────────────────────
+
+namespace {
+
+const char* func_to_str(int c) {
+  switch (c) {
+    case 'a': return "add";
+    case 'c': return "change";
+    case 'd': return "delete";
+    default:  return "?";
+  }
+}
+
+const char* bond_type_to_str(BondType t) {
+  switch (t) {
+    case BondType::Single:   return "single";
+    case BondType::Double:   return "double";
+    case BondType::Triple:   return "triple";
+    case BondType::Aromatic: return "aromatic";
+    case BondType::Deloc:    return "deloc";
+    case BondType::Metal:    return "metal";
+    case BondType::Unspec:   return ".";
+  }
+  return ".";
+}
+
+const char* chir_sign_to_str(ChiralityType s) {
+  switch (s) {
+    case ChiralityType::Positive: return "positive";
+    case ChiralityType::Negative: return "negative";
+    case ChiralityType::Both:     return "both";
+  }
+  return ".";
+}
+
+std::string val_or_dot(double v) {
+  if (std::isnan(v)) return ".";
+  return to_str(v);
+}
+
+void write_program_info(cif::Document& doc, const std::string& instruction) {
+  cif::Block& blk = doc.add_new_block("program_info");
+  blk.set_pair("_gemmi_version", cif::quote(GEMMI_VERSION));
+  if (!instruction.empty())
+    blk.set_pair("_CCP4_AceDRG_link_generation.instruction",
+                 ";\n" + instruction + "\n;");
+}
+
+void write_comp_list(cif::Document& doc,
+                     const ChemComp& cc1, const ChemComp& cc2) {
+  cif::Block& blk = doc.add_new_block("comp_list");
+  cif::Loop& loop = blk.init_loop("_chem_comp.", {
+      "id", "three_letter_code", "name", "group",
+      "number_atoms_all", "number_atoms_nh"});
+  auto add = [&](const ChemComp& cc) {
+    int n_all = (int) cc.atoms.size();
+    int n_nh = 0;
+    for (const auto& a : cc.atoms) if (!a.is_hydrogen()) ++n_nh;
+    loop.add_row({cc.name, cc.name, cif::quote(cc.name),
+                  ChemComp::group_str(cc.group),
+                  std::to_string(n_all), std::to_string(n_nh)});
+  };
+  add(cc1);
+  add(cc2);
+}
+
+void write_mod_list(cif::Document& doc, const LinkGenerationResult& res) {
+  cif::Block& blk = doc.add_new_block("mod_list");
+  cif::Loop& loop = blk.init_loop("_chem_mod.", {
+      "id", "name", "comp_id", "group_id"});
+  loop.add_row({res.mod1.id, cif::quote(res.mod1.name),
+                res.mod1.comp_id, res.mod1.group_id});
+  loop.add_row({res.mod2.id, cif::quote(res.mod2.name),
+                res.mod2.comp_id, res.mod2.group_id});
+}
+
+void write_link_list(cif::Document& doc,
+                     const LinkGenerationResult& res) {
+  cif::Block& blk = doc.add_new_block("link_list");
+  cif::Loop& loop = blk.init_loop("_chem_link.", {
+      "id", "comp_id_1", "mod_id_1", "group_comp_1",
+      "comp_id_2", "mod_id_2", "group_comp_2", "name"});
+  loop.add_row({res.link.id, res.link.side1.comp, res.link.side1.mod,
+                ChemComp::group_str(res.link.side1.group),
+                res.link.side2.comp, res.link.side2.mod,
+                ChemComp::group_str(res.link.side2.group),
+                cif::quote(res.link.name)});
+}
+
+void write_mod_block(cif::Document& doc, const ChemMod& mod) {
+  cif::Block& blk = doc.add_new_block("mod_" + mod.id);
+
+  if (!mod.atom_mods.empty()) {
+    cif::Loop& loop = blk.init_loop("_chem_mod_atom.", {
+        "mod_id", "function", "atom_id", "new_atom_id",
+        "new_type_symbol", "new_type_energy", "new_charge"});
+    for (const auto& a : mod.atom_mods)
+      loop.add_row({mod.id, func_to_str(a.func), a.old_id,
+                    a.new_id.empty() ? "." : a.new_id,
+                    a.el.name(),
+                    a.chem_type.empty() ? "." : a.chem_type,
+                    std::to_string((int) std::round(a.charge))});
+  }
+
+  if (!mod.rt.bonds.empty()) {
+    cif::Loop& loop = blk.init_loop("_chem_mod_bond.", {
+        "mod_id", "function", "atom_id_1", "atom_id_2",
+        "new_type", "new_value_dist", "new_value_dist_esd",
+        "new_value_dist_nucleus", "new_value_dist_nucleus_esd"});
+    for (const auto& b : mod.rt.bonds)
+      loop.add_row({mod.id, func_to_str(b.id1.comp),
+                    b.id1.atom, b.id2.atom,
+                    bond_type_to_str(b.type),
+                    val_or_dot(b.value), val_or_dot(b.esd),
+                    val_or_dot(b.value_nucleus), val_or_dot(b.esd_nucleus)});
+  }
+
+  if (!mod.rt.angles.empty()) {
+    cif::Loop& loop = blk.init_loop("_chem_mod_angle.", {
+        "mod_id", "function", "atom_id_1", "atom_id_2", "atom_id_3",
+        "new_value_angle", "new_value_angle_esd"});
+    for (const auto& a : mod.rt.angles)
+      loop.add_row({mod.id, func_to_str(a.id1.comp),
+                    a.id1.atom, a.id2.atom, a.id3.atom,
+                    val_or_dot(a.value), val_or_dot(a.esd)});
+  }
+
+  if (!mod.rt.torsions.empty()) {
+    cif::Loop& loop = blk.init_loop("_chem_mod_tor.", {
+        "mod_id", "function", "atom_id_1", "atom_id_2",
+        "atom_id_3", "atom_id_4", "id",
+        "new_value_angle", "new_value_angle_esd", "new_period"});
+    for (const auto& t : mod.rt.torsions)
+      loop.add_row({mod.id, func_to_str(t.id1.comp),
+                    t.id1.atom, t.id2.atom, t.id3.atom, t.id4.atom,
+                    t.label.empty() ? "." : t.label,
+                    val_or_dot(t.value), val_or_dot(t.esd),
+                    std::to_string(t.period)});
+  }
+
+  if (!mod.rt.chirs.empty()) {
+    cif::Loop& loop = blk.init_loop("_chem_mod_chir.", {
+        "mod_id", "function", "atom_id_centre",
+        "atom_id_1", "atom_id_2", "atom_id_3", "new_volume_sign"});
+    for (const auto& c : mod.rt.chirs)
+      loop.add_row({mod.id, func_to_str(c.id_ctr.comp),
+                    c.id_ctr.atom, c.id1.atom, c.id2.atom, c.id3.atom,
+                    chir_sign_to_str(c.sign)});
+  }
+
+  if (!mod.rt.planes.empty()) {
+    cif::Loop& loop = blk.init_loop("_chem_mod_plane_atom.", {
+        "mod_id", "function", "plane_id", "atom_id", "new_dist_esd"});
+    for (const auto& p : mod.rt.planes)
+      for (const auto& aid : p.ids)
+        loop.add_row({mod.id, func_to_str(aid.comp),
+                      p.label, aid.atom, val_or_dot(p.esd)});
+  }
+}
+
+void write_link_block(cif::Document& doc, const ChemLink& link) {
+  cif::Block& blk = doc.add_new_block("link_" + link.id);
+
+  if (!link.rt.bonds.empty()) {
+    cif::Loop& loop = blk.init_loop("_chem_link_bond.", {
+        "link_id", "atom_1_comp_id", "atom_id_1",
+        "atom_2_comp_id", "atom_id_2", "type",
+        "value_dist", "value_dist_esd"});
+    for (const auto& b : link.rt.bonds)
+      loop.add_row({link.id,
+                    std::to_string(b.id1.comp), b.id1.atom,
+                    std::to_string(b.id2.comp), b.id2.atom,
+                    bond_type_to_str(b.type),
+                    val_or_dot(b.value), val_or_dot(b.esd)});
+  }
+
+  if (!link.rt.angles.empty()) {
+    cif::Loop& loop = blk.init_loop("_chem_link_angle.", {
+        "link_id", "atom_1_comp_id", "atom_id_1",
+        "atom_2_comp_id", "atom_id_2",
+        "atom_3_comp_id", "atom_id_3",
+        "value_angle", "value_angle_esd"});
+    for (const auto& a : link.rt.angles)
+      loop.add_row({link.id,
+                    std::to_string(a.id1.comp), a.id1.atom,
+                    std::to_string(a.id2.comp), a.id2.atom,
+                    std::to_string(a.id3.comp), a.id3.atom,
+                    val_or_dot(a.value), val_or_dot(a.esd)});
+  }
+
+  if (!link.rt.torsions.empty()) {
+    cif::Loop& loop = blk.init_loop("_chem_link_tor.", {
+        "link_id", "id",
+        "atom_1_comp_id", "atom_id_1",
+        "atom_2_comp_id", "atom_id_2",
+        "atom_3_comp_id", "atom_id_3",
+        "atom_4_comp_id", "atom_id_4",
+        "value_angle", "value_angle_esd", "period"});
+    for (const auto& t : link.rt.torsions)
+      loop.add_row({link.id, t.label.empty() ? "." : t.label,
+                    std::to_string(t.id1.comp), t.id1.atom,
+                    std::to_string(t.id2.comp), t.id2.atom,
+                    std::to_string(t.id3.comp), t.id3.atom,
+                    std::to_string(t.id4.comp), t.id4.atom,
+                    val_or_dot(t.value), val_or_dot(t.esd),
+                    std::to_string(t.period)});
+  }
+
+  if (!link.rt.chirs.empty()) {
+    cif::Loop& loop = blk.init_loop("_chem_link_chir.", {
+        "link_id",
+        "atom_centre_comp_id", "atom_id_centre",
+        "atom_1_comp_id", "atom_id_1",
+        "atom_2_comp_id", "atom_id_2",
+        "atom_3_comp_id", "atom_id_3",
+        "volume_sign"});
+    for (const auto& c : link.rt.chirs)
+      loop.add_row({link.id,
+                    std::to_string(c.id_ctr.comp), c.id_ctr.atom,
+                    std::to_string(c.id1.comp), c.id1.atom,
+                    std::to_string(c.id2.comp), c.id2.atom,
+                    std::to_string(c.id3.comp), c.id3.atom,
+                    chir_sign_to_str(c.sign)});
+  }
+
+  if (!link.rt.planes.empty()) {
+    cif::Loop& loop = blk.init_loop("_chem_link_plane.", {
+        "link_id", "plane_id",
+        "atom_comp_id", "atom_id", "dist_esd"});
+    for (const auto& p : link.rt.planes)
+      for (const auto& aid : p.ids)
+        loop.add_row({link.id, p.label,
+                      std::to_string(aid.comp), aid.atom,
+                      val_or_dot(p.esd)});
+  }
+}
+
+}  // anonymous namespace
+
+void write_link_dictionary(const ChemComp& cc1, const ChemComp& cc2,
+                           const LinkGenerationResult& res,
+                           cif::Document& doc,
+                           const std::string& instruction) {
+  write_program_info(doc, instruction);
+  write_comp_list(doc, cc1, cc2);
+  write_mod_list(doc, res);
+  write_link_list(doc, res);
+
+  // Full monomer dictionaries.
+  cif::Block& blk_cc1 = doc.add_new_block("comp_" + cc1.name);
+  add_chemcomp_to_block(cc1, blk_cc1);
+  cif::Block& blk_cc2 = doc.add_new_block("comp_" + cc2.name);
+  add_chemcomp_to_block(cc2, blk_cc2);
+
+  // Mod blocks.
+  write_mod_block(doc, res.mod1);
+  write_mod_block(doc, res.mod2);
+
+  // Link block.
+  write_link_block(doc, res.link);
 }
 
 }  // namespace gemmi
