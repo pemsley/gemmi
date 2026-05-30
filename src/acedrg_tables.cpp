@@ -2374,15 +2374,24 @@ void AcedrgTables::fill_restraints(ChemComp& cc) const {
   // per-molecule cache.
   if (sqlite_session_) {
     std::map<std::string, size_t> atom_idx = cc.make_atom_index();
-    std::vector<std::pair<int, int>> bond_pairs;
-    bond_pairs.reserve(cc.rt.bonds.size());
+    std::vector<std::tuple<int, int, std::string>> bond_keys;
+    bond_keys.reserve(cc.rt.bonds.size());
     for (const auto& b : cc.rt.bonds) {
       auto it1 = atom_idx.find(b.id1.atom);
       auto it2 = atom_idx.find(b.id2.atom);
       if (it1 == atom_idx.end() || it2 == atom_idx.end()) continue;
-      int h1 = atom_info[it1->second].hashing_value;
-      int h2 = atom_info[it2->second].hashing_value;
-      bond_pairs.emplace_back(std::min(h1, h2), std::max(h1, h2));
+      const CodAtomInfo& ai1 = atom_info[it1->second];
+      const CodAtomInfo& ai2 = atom_info[it2->second];
+      int h1 = ai1.hashing_value;
+      int h2 = ai2.hashing_value;
+      std::string s1 = hybridization_to_string(ai1.hybrid);
+      std::string s2 = hybridization_to_string(ai2.hybrid);
+      // Schema convention: hashes sorted ascending; hybridization strings
+      // sorted lexicographically and joined with '_'.
+      if (h1 > h2) std::swap(h1, h2);
+      if (s1 > s2) std::swap(s1, s2);
+      std::string hybr_comb = s1 + "_" + s2;
+      bond_keys.emplace_back(h1, h2, std::move(hybr_comb));
     }
     std::vector<std::tuple<int, int, int>> angle_triples;
     angle_triples.reserve(cc.rt.angles.size());
@@ -2416,7 +2425,7 @@ void AcedrgTables::fill_restraints(ChemComp& cc) const {
           }
       }
     }
-    prefetch_for_molecule(bond_pairs, angle_triples);
+    prefetch_for_molecule(bond_keys, angle_triples);
   }
 
   AceGraphView graph = make_ace_graph_view(cc);

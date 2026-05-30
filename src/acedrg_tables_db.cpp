@@ -568,7 +568,7 @@ void AcedrgTables::prefetch_for_hashes(const std::set<int>& hashes) const {
 // ─── prefetch_for_molecule (targeted pair/triple) ────────────────────────────
 
 void AcedrgTables::prefetch_for_molecule(
-    const std::vector<std::pair<int, int>>& bond_hash_pairs,
+    const std::vector<std::tuple<int, int, std::string>>& bond_keys,
     const std::vector<std::tuple<int, int, int>>& angle_hash_triples) const {
   if (!sqlite_session_ || !sqlite_session_->db)
     return;
@@ -585,27 +585,42 @@ void AcedrgTables::prefetch_for_molecule(
   angle_idx_5d_.clear();
   angle_idx_6d_.clear();
 
-  // Dedup to avoid issuing the same pair twice.
-  std::set<std::pair<int, int>> uniq_pairs(bond_hash_pairs.begin(),
-                                           bond_hash_pairs.end());
+  // Dedup the keys.
+  std::set<std::tuple<int, int, std::string>> uniq_bonds(bond_keys.begin(),
+                                                         bond_keys.end());
   std::set<std::tuple<int, int, int>> uniq_triples(angle_hash_triples.begin(),
                                                    angle_hash_triples.end());
 
-  // ── bond rows: (ha1, ha2) ∈ {pairs} ───────────────────────────────────────
-  if (!uniq_pairs.empty()) {
+  // Helper: SQLite-quote a string value so we can splice it directly into
+  // the WHERE-clause VALUES literal. Atom-type strings can contain only
+  // [A-Za-z0-9_/.:[]()<>-] in practice; we double single-quotes for safety.
+  auto sql_quote = [](const std::string& s) {
+    std::string out; out.reserve(s.size() + 2);
+    out += '\'';
+    for (char c : s) { if (c == '\'') out += "''"; else out += c; }
+    out += '\'';
+    return out;
+  };
+
+  // ── bond rows: (ha1, ha2, hybr_comb) ∈ {keys}.
+  //    Note: we drop the in_ring filter so the Y/N ring-fallback in
+  //    fill_bond still works (it tries both values).
+  if (!uniq_bonds.empty()) {
     std::string sql =
         "SELECT ha1, ha2, hybr_comb, in_ring,"
         " a1_nb2, a2_nb2, a1_nb, a2_nb,"
         " a1_type_m, a2_type_m, a1_type_f, a2_type_f,"
         " value, sigma, count, value_1d, sigma_1d, count_1d"
-        " FROM bond_entries WHERE (ha1, ha2) IN (VALUES ";
+        " FROM bond_entries WHERE (ha1, ha2, hybr_comb) IN (VALUES ";
     bool first = true;
-    for (auto& p : uniq_pairs) {
+    for (auto& t : uniq_bonds) {
       if (!first) sql += ',';
       sql += '(';
-      sql += std::to_string(p.first);
+      sql += std::to_string(std::get<0>(t));
       sql += ',';
-      sql += std::to_string(p.second);
+      sql += std::to_string(std::get<1>(t));
+      sql += ',';
+      sql += sql_quote(std::get<2>(t));
       sql += ')';
       first = false;
     }
@@ -647,8 +662,8 @@ void AcedrgTables::prefetch_for_molecule(
     }
     sqlite3_finalize(st);
     if (verbose >= 1)
-      std::fprintf(stderr, "  [db] bond prefetch: %zu pairs -> %d rows\n",
-                   uniq_pairs.size(), n_rows);
+      std::fprintf(stderr, "  [db] bond prefetch: %zu (ha1,ha2,hybr) -> %d rows\n",
+                   uniq_bonds.size(), n_rows);
   }
 
   // ── angle rows: (ha1, ha2, ha3) ∈ {triples} ──────────────────────────────
@@ -728,7 +743,7 @@ void AcedrgTables::open_sqlite(const std::string&) {
 
 void AcedrgTables::prefetch_for_hashes(const std::set<int>&) const {}
 void AcedrgTables::prefetch_for_molecule(
-    const std::vector<std::pair<int, int>>&,
+    const std::vector<std::tuple<int, int, std::string>>&,
     const std::vector<std::tuple<int, int, int>>&) const {}
 
 bool build_acedrg_sqlite(const std::string&, const std::string&) {

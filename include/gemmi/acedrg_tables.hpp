@@ -191,13 +191,15 @@ struct GEMMI_DLL AcedrgTables {
   // alternative.
   void prefetch_for_hashes(const std::set<int>& hashes) const;
 
-  // Targeted prefetch: pull only the table rows whose (ha1, ha2) pair
-  // (or (ha1, ha2, ha3) triple) actually appears as a bond/angle in the
-  // input molecule. Far fewer rows than prefetch_for_hashes when the
-  // molecule contains common atom types — typical sized molecule pulls
-  // hundreds of rows rather than hundreds of thousands.
+  // Targeted prefetch: pull only the table rows whose
+  //   (ha1, ha2, hybr_comb) bond key, or
+  //   (ha1, ha2, ha3)       angle key
+  // actually appears in the input molecule. Far fewer rows than
+  // prefetch_for_hashes when the molecule contains common atom types —
+  // typical sized molecule pulls hundreds of rows rather than hundreds
+  // of thousands.
   void prefetch_for_molecule(
-      const std::vector<std::pair<int, int>>& bond_hash_pairs,
+      const std::vector<std::tuple<int, int, std::string>>& bond_keys,
       const std::vector<std::tuple<int, int, int>>& angle_hash_triples) const;
 
   /// Serialise the loaded heavy tables (bond/angle indices and their side
