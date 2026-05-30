@@ -12,6 +12,7 @@
 #include <array>
 #include <set>
 #include <map>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include <cmath>
@@ -104,6 +105,9 @@ struct CodStats {
   CodStats(double v, double s, int c, int lvl = 0) : value(v), sigma(s), count(c), level(lvl) {}
 };
 
+// Opaque sqlite session, defined in src/acedrg_tables_db.cpp.
+struct AcedrgSqliteSession;
+
 // Protonated hydrogen distances (both electron cloud and nucleus)
 struct ProtHydrDist {
   double electron_val = NAN;
@@ -155,10 +159,46 @@ struct TorsionEntry {
 // ============================================================================
 
 struct GEMMI_DLL AcedrgTables {
-  AcedrgTables() = default;
+  AcedrgTables();
+  ~AcedrgTables();
+  AcedrgTables(const AcedrgTables&) = delete;
+  AcedrgTables& operator=(const AcedrgTables&) = delete;
 
-  // Load all tables from directory
+  // Load all tables from directory. If `tables_dir` contains a sibling
+  // `acedrg.sqlite` file, it is opened and used as an on-demand backend
+  // for the heavy bond/angle indices; otherwise (or if it can't be
+  // opened) the indices are loaded from ASCII as before.
   void load_tables(const std::string& tables_dir, bool skip_angles = false);
+
+  // Open a SQLite-backed lookup session against the given DB file.
+  // After this returns, fill_restraints() / fill_bond() / fill_angle()
+  // will prefetch only the rows relevant to the current molecule before
+  // consulting the (now small) in-memory cache. Throws std::runtime_error
+  // on open failure.
+  void open_sqlite(const std::string& sqlite_path);
+  // Close any open SQLite session and free associated state. Safe to
+  // call even when no session is open. Defined out-of-line in
+  // src/acedrg_tables_db.cpp so the opaque AcedrgSqliteSession type is
+  // complete at the point of deletion.
+  void close_sqlite();
+  bool has_sqlite() const { return sqlite_session_ != nullptr; }
+
+  // Populate the (mutable) in-memory bond_idx_* / angle_idx_* caches
+  // with every row whose atom hash codes are all in `hashes`. Coarse
+  // filter; mostly useful for batch pre-warming. Typically *over-fetches*
+  // because the SQL is (ha1 IN H AND ha2 IN H), matching any pair, not
+  // only the bonded ones — see prefetch_for_molecule for the targeted
+  // alternative.
+  void prefetch_for_hashes(const std::set<int>& hashes) const;
+
+  // Targeted prefetch: pull only the table rows whose (ha1, ha2) pair
+  // (or (ha1, ha2, ha3) triple) actually appears as a bond/angle in the
+  // input molecule. Far fewer rows than prefetch_for_hashes when the
+  // molecule contains common atom types — typical sized molecule pulls
+  // hundreds of rows rather than hundreds of thousands.
+  void prefetch_for_molecule(
+      const std::vector<std::pair<int, int>>& bond_hash_pairs,
+      const std::vector<std::tuple<int, int, int>>& angle_hash_triples) const;
 
   /// Serialise the loaded heavy tables (bond/angle indices and their side
   /// sets) to a single binary file. Reading this file with `load_binary`
@@ -289,14 +329,14 @@ struct GEMMI_DLL AcedrgTables {
   //   -> 2 inner map levels (a1_type_m -> a2_type_m -> vector<CodStats>)
   using BondIdx1D = std::unordered_map<std::string,
     std::map<std::string, std::map<std::string, std::vector<CodStats>>>>;
-  BondIdx1D bond_idx_1d_;
+  mutable BondIdx1D bond_idx_1d_;
 
   // Exact match with full COD class
   // Flattened: 10-component key (ha1|..|a1_type_m|a2_type_m)
   //   -> 2 inner levels (a1_type_f -> a2_type_f -> CodStats)
   using BondIdxFull = std::unordered_map<std::string,
     std::map<std::string, std::map<std::string, CodStats>>>;
-  BondIdxFull bond_idx_full_;
+  mutable BondIdxFull bond_idx_full_;
 
   // Levels 3-8: 4-component key (ha1|ha2|hybr|ring)
   //   -> 4 inner levels (a1nb2 -> a2nb2 -> a1nb -> a2nb -> vector<CodStats>)
@@ -304,7 +344,7 @@ struct GEMMI_DLL AcedrgTables {
     std::map<std::string, std::map<std::string,
     std::map<std::string, std::map<std::string,
     std::vector<CodStats>>>>>>;
-  BondIdx2D bond_idx_2d_;
+  mutable BondIdx2D bond_idx_2d_;
 
   // Levels 9-11: Hash+Sp fallback, fully flat compound keys
   using BondHaSp2D = std::unordered_map<std::string, std::vector<CodStats>>;
@@ -318,8 +358,8 @@ struct GEMMI_DLL AcedrgTables {
   std::unordered_map<std::string, int> bond_file_index_;
 
   // Side sets for prefix-existence checks in bond lookup
-  std::unordered_set<std::string> bond_2d_hybr_keys_;     // 3-component (ha1|ha2|hybr)
-  std::unordered_set<std::string> bond_full_4prefix_keys_; // 4-component (ha1|ha2|hybr|ring)
+  mutable std::unordered_set<std::string> bond_2d_hybr_keys_;     // 3-component (ha1|ha2|hybr)
+  mutable std::unordered_set<std::string> bond_full_4prefix_keys_; // 4-component (ha1|ha2|hybr|ring)
 
   // Atom type code mapping: coded -> full type string
   std::unordered_map<std::string, std::string> atom_type_codes_;
@@ -327,22 +367,28 @@ struct GEMMI_DLL AcedrgTables {
   // Detailed indexed angle tables from allOrgAngleTables/*.table
   // Fully flat compound keys for levels 1D-4D, 6D
   using AngleIdx1D = std::unordered_map<std::string, std::vector<CodStats>>;
-  AngleIdx1D angle_idx_1d_;   // 16-component key
+  mutable AngleIdx1D angle_idx_1d_;   // 16-component key
   using AngleIdx2D = std::unordered_map<std::string, std::vector<CodStats>>;
-  AngleIdx2D angle_idx_2d_;   // 13-component key
+  mutable AngleIdx2D angle_idx_2d_;   // 13-component key
   using AngleIdx3D = std::unordered_map<std::string, std::vector<CodStats>>;
-  AngleIdx3D angle_idx_3d_;   // 10-component key
+  mutable AngleIdx3D angle_idx_3d_;   // 10-component key
   using AngleIdx4D = std::unordered_map<std::string, std::vector<CodStats>>;
-  AngleIdx4D angle_idx_4d_;   // 7-component key
+  mutable AngleIdx4D angle_idx_4d_;   // 7-component key
 
   // Level 5D: kept nested for wildcard iteration in fill_angle
   using AngleIdx5D = std::unordered_map<int, std::unordered_map<int,
     std::unordered_map<int, std::map<std::string, std::vector<CodStats>>>>>;
-  AngleIdx5D angle_idx_5d_;
+  mutable AngleIdx5D angle_idx_5d_;
 
   // Level 6D: flat 3-component key (ha1|ha2|ha3)
   using AngleIdx6D = std::unordered_map<std::string, std::vector<CodStats>>;
-  AngleIdx6D angle_idx_6d_;
+  mutable AngleIdx6D angle_idx_6d_;
+
+  // SQLite session for the on-demand lookup backend. nullptr when the
+  // backend is the legacy in-memory load. Owning unique_ptr — destructor
+  // declared above, defined out-of-line in src/acedrg_tables_db.cpp so
+  // the opaque struct is complete at the point of deletion.
+  mutable std::unique_ptr<AcedrgSqliteSession> sqlite_session_;
 
   // Element + hybridization based fallback bonds
   using ENBonds = std::map<std::string, std::map<std::string,
@@ -379,6 +425,43 @@ struct GEMMI_DLL AcedrgTables {
   void load_nucl_tors(const std::string& path);
   void load_prot_hydr_dists(const std::string& path);
   void load_angle_tables(const std::string& dir);
+
+  // Insert one parsed bond / angle row into all relevant lookup caches.
+  // Shared by the ASCII loaders and the SQLite prefetch path. The two
+  // string buffers are reused across calls to avoid allocations.
+  void insert_bond_row(int ha1, int ha2,
+                       const std::string& hybr_comb,
+                       const std::string& in_ring,
+                       const std::string& a1_nb2,
+                       const std::string& a2_nb2,
+                       const std::string& a1_nb,
+                       const std::string& a2_nb,
+                       const std::string& a1_type_m,
+                       const std::string& a2_type_m,
+                       const std::string& a1_type_f,
+                       const std::string& a2_type_f,
+                       const CodStats& vs,
+                       const CodStats& vs1d,
+                       std::string& key_buf,
+                       std::string& hybr_buf) const;
+  void insert_angle_row(int ha1, int ha2, int ha3,
+                        const std::string& value_key,
+                        const std::string& a1_root,
+                        const std::string& a2_root,
+                        const std::string& a3_root,
+                        const std::string& a1_nb2,
+                        const std::string& a2_nb2,
+                        const std::string& a3_nb2,
+                        const std::string& a1_nb,
+                        const std::string& a2_nb,
+                        const std::string& a3_nb,
+                        const std::string& a1_type,
+                        const std::string& a2_type,
+                        const std::string& a3_type,
+                        const double v[6],
+                        const double s[6],
+                        const int    c[6],
+                        std::string& key_buf) const;
 
  private:
   void compute_hash(CodAtomInfo& atom) const;

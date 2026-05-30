@@ -389,6 +389,35 @@ void AcedrgTables::load_tables(const std::string& tables_dir, bool skip_angles) 
   load_bond_index(tables_dir + "/allOrgBondTables/bond_idx.table");
   lap("load_bond_index");
 
+  // If a SQLite database exists alongside the ASCII tables, open it as
+  // the on-demand lookup backend and skip the two heavy ASCII loaders
+  // entirely. fill_restraints() will prefetch the small subset of rows
+  // relevant to the input molecule before consulting the caches.
+  {
+    std::string db_path = tables_dir + "/acedrg.sqlite";
+    if (fileptr_t f = file_open_or_null(db_path.c_str(), "rb")) {
+      f.reset();
+      try {
+        open_sqlite(db_path);
+        lap("open_sqlite (lazy backend)");
+        // Cheap loaders done above; skip load_bond_tables and
+        // load_angle_tables. The pep/nucl torsion loaders still run.
+        load_pep_tors(tables_dir + "/pep_tors.table");
+        lap("load_pep_tors");
+        load_nucl_tors(tables_dir + "/nucl_tors.table");
+        lap("load_nucl_tors");
+        tables_loaded_ = true;
+        return;
+      } catch (const std::exception& e) {
+        if (verbose >= 1)
+          std::fprintf(stderr, "    [warn] %s — falling back to in-memory load\n",
+                       e.what());
+        // Clear half-opened state and continue with the legacy path.
+        close_sqlite();
+      }
+    }
+  }
+
   // If a binary cache exists alongside the ASCII tables, use it for the
   // two heavy index loaders. Falls back to ASCII transparently if the
   // file is missing, malformed, or a version mismatch.
@@ -811,6 +840,96 @@ void AcedrgTables::load_bond_index(const std::string& path) {
       bond_file_index_[cat(ha1, '|', ha2)] = file_num;
     }
   }
+}
+
+// Add one parsed bond record into all the relevant lookup caches. Shared
+// between the ASCII loader (load_bond_tables) and the SQLite-backed
+// prefetch path (prefetch_for_hashes). The `key_buf` and `hybr_buf`
+// arguments are reused across many calls to avoid allocations.
+void AcedrgTables::insert_bond_row(int ha1, int ha2,
+                                   const std::string& hybr_comb,
+                                   const std::string& in_ring,
+                                   const std::string& a1_nb2,
+                                   const std::string& a2_nb2,
+                                   const std::string& a1_nb,
+                                   const std::string& a2_nb,
+                                   const std::string& a1_type_m,
+                                   const std::string& a2_type_m,
+                                   const std::string& a1_type_f,
+                                   const std::string& a2_type_f,
+                                   const CodStats& vs,
+                                   const CodStats& vs1d,
+                                   std::string& key_buf,
+                                   std::string& hybr_buf) const {
+  key_buf.clear();
+  cat_to(key_buf, ha1, '|', ha2, '|', hybr_comb, '|', in_ring);
+  const size_t key_4_len = key_buf.size();
+  cat_to(key_buf, '|', a1_nb2, '|', a2_nb2, '|', a1_nb, '|', a2_nb);
+
+  bond_idx_1d_[key_buf][a1_type_m][a2_type_m].push_back(vs1d);
+
+  if (!a1_type_f.empty() && !a2_type_f.empty()) {
+    cat_to(key_buf, '|', a1_type_m, '|', a2_type_m);
+    bond_idx_full_[key_buf][a1_type_f][a2_type_f] = vs;
+    key_buf.resize(key_4_len);
+    bond_full_4prefix_keys_.insert(key_buf);
+  } else {
+    key_buf.resize(key_4_len);
+  }
+
+  bond_idx_2d_[key_buf][a1_nb2][a2_nb2][a1_nb][a2_nb].push_back(vs);
+
+  hybr_buf.clear();
+  cat_to(hybr_buf, ha1, '|', ha2, '|', hybr_comb);
+  bond_2d_hybr_keys_.insert(hybr_buf);
+}
+
+// Same idea for an angle row. The 6 stat levels (v[0..5], s[0..5], c[0..5])
+// come from the 6 column-sets per angle table row.
+void AcedrgTables::insert_angle_row(int ha1, int ha2, int ha3,
+                                    const std::string& value_key,
+                                    const std::string& a1_root,
+                                    const std::string& a2_root,
+                                    const std::string& a3_root,
+                                    const std::string& a1_nb2,
+                                    const std::string& a2_nb2,
+                                    const std::string& a3_nb2,
+                                    const std::string& a1_nb,
+                                    const std::string& a2_nb,
+                                    const std::string& a3_nb,
+                                    const std::string& a1_type,
+                                    const std::string& a2_type,
+                                    const std::string& a3_type,
+                                    const double v[6],
+                                    const double s[6],
+                                    const int    c[6],
+                                    std::string& key_buf) const {
+  auto insert_first = [](AngleIdx1D& m, const std::string& k,
+                         double vv, double ss, int cc) {
+    auto& vec = m[k];
+    if (vec.empty())
+      vec.push_back(CodStats(vv, ss, cc));
+  };
+
+  key_buf.clear();
+  cat_to(key_buf, ha1, '|', ha2, '|', ha3, '|', value_key, '|',
+         a1_root, '|', a2_root, '|', a3_root);
+
+  insert_first(angle_idx_4d_, key_buf, v[4], s[4], c[4]);
+
+  cat_to(key_buf, '|', a1_nb2, '|', a2_nb2, '|', a3_nb2);
+  insert_first(angle_idx_3d_, key_buf, v[3], s[3], c[3]);
+
+  cat_to(key_buf, '|', a1_nb, '|', a2_nb, '|', a3_nb);
+  insert_first(angle_idx_2d_, key_buf, v[2], s[2], c[2]);
+
+  cat_to(key_buf, '|', a1_type, '|', a2_type, '|', a3_type);
+  insert_first(angle_idx_1d_, key_buf, v[1], s[1], c[1]);
+
+  // Level 5D: nested int-keyed map.
+  auto& vec5 = angle_idx_5d_[ha1][ha2][ha3][value_key];
+  if (vec5.empty())
+    vec5.push_back(CodStats(v[5], s[5], c[5]));
 }
 
 void AcedrgTables::load_bond_tables(const std::string& dir) {
@@ -2248,6 +2367,58 @@ void AcedrgTables::fill_restraints(ChemComp& cc) const {
 
   // Classify atoms
   std::vector<CodAtomInfo> atom_info = classify_atoms(cc);
+
+  // If the SQLite backend is open, prefetch only the (ha1, ha2) pairs
+  // and (ha1, ha2, ha3) triples that this molecule's bonds and angles
+  // actually need. fill_bond / fill_angle then run against the (small)
+  // per-molecule cache.
+  if (sqlite_session_) {
+    std::map<std::string, size_t> atom_idx = cc.make_atom_index();
+    std::vector<std::pair<int, int>> bond_pairs;
+    bond_pairs.reserve(cc.rt.bonds.size());
+    for (const auto& b : cc.rt.bonds) {
+      auto it1 = atom_idx.find(b.id1.atom);
+      auto it2 = atom_idx.find(b.id2.atom);
+      if (it1 == atom_idx.end() || it2 == atom_idx.end()) continue;
+      int h1 = atom_info[it1->second].hashing_value;
+      int h2 = atom_info[it2->second].hashing_value;
+      bond_pairs.emplace_back(std::min(h1, h2), std::max(h1, h2));
+    }
+    std::vector<std::tuple<int, int, int>> angle_triples;
+    angle_triples.reserve(cc.rt.angles.size());
+    for (const auto& a : cc.rt.angles) {
+      auto i1 = atom_idx.find(a.id1.atom);
+      auto i2 = atom_idx.find(a.id2.atom);
+      auto i3 = atom_idx.find(a.id3.atom);
+      if (i1 == atom_idx.end() || i2 == atom_idx.end() || i3 == atom_idx.end())
+        continue;
+      int h1 = atom_info[i1->second].hashing_value;
+      int h2 = atom_info[i2->second].hashing_value;
+      int h3 = atom_info[i3->second].hashing_value;
+      // Schema convention: ha1=center hash; outers sorted into (ha2, ha3).
+      int outer_lo = std::min(h1, h3);
+      int outer_hi = std::max(h1, h3);
+      angle_triples.emplace_back(h2, outer_lo, outer_hi);
+    }
+    // If the input has no angles (e.g. CCD-style), seed angle triples
+    // from neighbour pairs around each atom — those are the angles the
+    // pipeline will derive.
+    if (angle_triples.empty()) {
+      AceBondAdjacency adj0 = build_bond_adjacency(cc, atom_idx);
+      for (size_t centre = 0; centre < cc.atoms.size(); ++centre) {
+        const auto& nbs = adj0[centre];
+        int hc = atom_info[centre].hashing_value;
+        for (size_t i = 0; i < nbs.size(); ++i)
+          for (size_t j = i + 1; j < nbs.size(); ++j) {
+            int ha = atom_info[nbs[i].idx].hashing_value;
+            int hb = atom_info[nbs[j].idx].hashing_value;
+            angle_triples.emplace_back(hc, std::min(ha, hb), std::max(ha, hb));
+          }
+      }
+    }
+    prefetch_for_molecule(bond_pairs, angle_triples);
+  }
+
   AceGraphView graph = make_ace_graph_view(cc);
   std::vector<std::vector<int>>& neighbors = graph.neighbors;
   std::vector<std::string> ccp4_types;
