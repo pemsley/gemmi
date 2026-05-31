@@ -297,7 +297,8 @@ Hybridization hybridization_from_string(const std::string& s) {
 }
 
 
-void AcedrgTables::load_tables(const std::string& tables_dir, bool skip_angles) {
+void AcedrgTables::load_tables(const std::string& tables_dir, bool skip_angles,
+                               Backend backend) {
   using Clock = std::chrono::steady_clock;
   auto t0 = Clock::now();
   auto lap = [&](const char* label) {
@@ -389,14 +390,18 @@ void AcedrgTables::load_tables(const std::string& tables_dir, bool skip_angles) 
   load_bond_index(tables_dir + "/allOrgBondTables/bond_idx.table");
   lap("load_bond_index");
 
-  // If a SQLite database exists alongside the ASCII tables, open it as
-  // the on-demand lookup backend and skip the two heavy ASCII loaders
-  // entirely. fill_restraints() will prefetch the small subset of rows
-  // relevant to the input molecule before consulting the caches.
-  {
+  // If the SQLite database exists alongside the ASCII tables (and the
+  // user hasn't asked otherwise), open it as the on-demand lookup
+  // backend and skip the two heavy ASCII loaders entirely.
+  // fill_restraints() will prefetch the small subset of rows relevant
+  // to the input molecule before consulting the caches.
+  if (backend == Backend::Auto || backend == Backend::Sqlite) {
     std::string db_path = tables_dir + "/acedrg.sqlite";
-    if (fileptr_t f = file_open_or_null(db_path.c_str(), "rb")) {
-      f.reset();
+    bool db_exists = static_cast<bool>(file_open_or_null(db_path.c_str(), "rb"));
+    if (backend == Backend::Sqlite && !db_exists)
+      throw std::runtime_error("backend=sqlite requested but " + db_path +
+                               " is not present");
+    if (db_exists) {
       try {
         open_sqlite(db_path);
         lap("open_sqlite (lazy backend)");
@@ -409,6 +414,8 @@ void AcedrgTables::load_tables(const std::string& tables_dir, bool skip_angles) 
         tables_loaded_ = true;
         return;
       } catch (const std::exception& e) {
+        if (backend == Backend::Sqlite)
+          throw;  // explicit request → fail loud
         if (verbose >= 1)
           std::fprintf(stderr, "    [warn] %s — falling back to in-memory load\n",
                        e.what());
@@ -419,10 +426,12 @@ void AcedrgTables::load_tables(const std::string& tables_dir, bool skip_angles) 
   }
 
   // If a binary cache exists alongside the ASCII tables, use it for the
-  // two heavy index loaders. Falls back to ASCII transparently if the
-  // file is missing, malformed, or a version mismatch.
+  // two heavy index loaders. Forced off when backend == Ascii.
   std::string bin_path = tables_dir + "/acedrg_cache.bin";
   bool used_binary = false;
+  if (backend == Backend::Ascii) {
+    // Skip the binary-cache shortcut entirely.
+  } else
   if (fileptr_t f = file_open_or_null(bin_path.c_str(), "rb")) {
     f.reset();  // close it before load_binary reopens
     try {

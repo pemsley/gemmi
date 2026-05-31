@@ -25,7 +25,7 @@ namespace {
 
 enum OptionIndex {
   Tables=4, Sigma, Timing, CifStyle, OutputDir, NoAngles, CoordModel, OnlyXyz,
-  LinkSpecOpt, BuildTableCache, BuildTableDb
+  LinkSpecOpt, BuildTableCache, BuildTableDb, BackendOpt
 };
 
 const option::Descriptor Usage[] = {
@@ -59,6 +59,13 @@ const option::Descriptor Usage[] = {
     "\n\t\txyz | example | ideal | first | auto (default: auto)." },
   { OnlyXyz, 0, "", "only-xyz", Arg::None,
     "  --only-xyz  \tDo not fill restraints; only generate/update ideal coordinates." },
+  { BackendOpt, 0, "", "backend", Arg::Required,
+    "  --backend=KIND  \tWhich table backend to use:"
+    "\n\t\t  auto    (default) sqlite if acedrg.sqlite present, else"
+    "\n\t\t          binary cache if acedrg_cache.bin present, else ASCII"
+    "\n\t\t  ascii   force the in-memory ASCII load (~10s); skip both caches"
+    "\n\t\t  sqlite  require the SQLite backend; error if acedrg.sqlite missing"
+    "\n\t\t  binary  skip sqlite; use binary cache if present, else ASCII" },
   { BuildTableDb, 0, "", "build-table-db", Arg::Required,
     "  --build-table-db=OUT.sqlite  \tConvert the ASCII AceDRG tables under"
     "\n\t\t--tables=DIR (or ACEDRG_TABLES / $CCP4/share/acedrg/tables) into"
@@ -695,6 +702,21 @@ int GEMMI_MAIN(int argc, char **argv) {
     }
   }
 
+  // Parse --backend (default Auto).
+  AcedrgTables::Backend backend = AcedrgTables::Backend::Auto;
+  if (p.options[BackendOpt]) {
+    std::string b = p.options[BackendOpt].arg;
+    if      (b == "auto")   backend = AcedrgTables::Backend::Auto;
+    else if (b == "ascii")  backend = AcedrgTables::Backend::Ascii;
+    else if (b == "sqlite") backend = AcedrgTables::Backend::Sqlite;
+    else if (b == "binary") backend = AcedrgTables::Backend::Binary;
+    else {
+      std::fprintf(stderr, "ERROR: Invalid --backend=%s (allowed: auto|ascii|sqlite|binary)\n",
+                   b.c_str());
+      return 1;
+    }
+  }
+
   Timer timer(p.options[Timing]);
 
   try {
@@ -704,7 +726,7 @@ int GEMMI_MAIN(int argc, char **argv) {
         std::fprintf(stderr, "Loading tables from %s ...\n", tables_dir.c_str());
       timer.start();
       tables.verbose = verbose;
-      tables.load_tables(tables_dir, no_angles);
+      tables.load_tables(tables_dir, no_angles, backend);
       timer.print("Tables loaded in");
 
       if (p.options[Sigma])

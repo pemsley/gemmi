@@ -164,11 +164,21 @@ struct GEMMI_DLL AcedrgTables {
   AcedrgTables(const AcedrgTables&) = delete;
   AcedrgTables& operator=(const AcedrgTables&) = delete;
 
-  // Load all tables from directory. If `tables_dir` contains a sibling
-  // `acedrg.sqlite` file, it is opened and used as an on-demand backend
-  // for the heavy bond/angle indices; otherwise (or if it can't be
-  // opened) the indices are loaded from ASCII as before.
-  void load_tables(const std::string& tables_dir, bool skip_angles = false);
+  // Which backend to use for the heavy bond/angle indices.
+  enum class Backend {
+    Auto,    // try sqlite first, then binary cache, then ASCII
+    Ascii,   // force ASCII; skip sqlite AND binary cache (original behaviour, ~10s)
+    Sqlite,  // require sqlite; throw if acedrg.sqlite is missing or bad
+    Binary,  // skip sqlite; use binary cache (acedrg_cache.bin) if present, else ASCII
+  };
+
+  // Load all tables from directory. With backend == Auto (default), if
+  // `tables_dir` contains a sibling `acedrg.sqlite` file, it is opened
+  // and used as an on-demand backend; else the binary cache
+  // `acedrg_cache.bin` is used if present; else the indices are loaded
+  // from ASCII. Other backend values override that detection.
+  void load_tables(const std::string& tables_dir, bool skip_angles = false,
+                   Backend backend = Backend::Auto);
 
   // Open a SQLite-backed lookup session against the given DB file.
   // After this returns, fill_restraints() / fill_bond() / fill_angle()
