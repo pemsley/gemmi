@@ -245,6 +245,24 @@ bool apply_coord_model(const cif::Block& block, ChemComp& cc, ChemCompModel kind
 void add_chemcomp_atom_to_block_with_ideal_coords(const ChemComp& cc,
                                                   cif::Block& block,
                                                   const std::vector<std::string>& acedrg_types) {
+  // Record where _chem_comp_atom. currently lives so we can put the
+  // rebuilt loop back in the same slot — otherwise erase + find_or_add
+  // pushes it to the end of the block, after _chem_comp_bond, which
+  // violates the CCD convention atom -> bond -> angle -> ...
+  size_t orig_pos = SIZE_MAX;
+  for (size_t i = 0; i < block.items.size(); ++i)
+    if (block.items[i].has_prefix("_chem_comp_atom.")) {
+      orig_pos = i;
+      break;
+    }
+  // If the atom category was missing, put it just before _chem_comp_bond.
+  if (orig_pos == SIZE_MAX)
+    for (size_t i = 0; i < block.items.size(); ++i)
+      if (block.items[i].has_prefix("_chem_comp_bond.")) {
+        orig_pos = i;
+        break;
+      }
+
   block.find_mmcif_category("_chem_comp_atom.").erase();
   std::vector<std::string> tags =
       {"comp_id", "atom_id", "type_symbol", "type_energy", "charge"};
@@ -283,6 +301,19 @@ void add_chemcomp_atom_to_block_with_ideal_coords(const ChemComp& cc,
     row[col++] = to_str(a.xyz.y);
     row[col++] = to_str(a.xyz.z);
     ++idx;
+  }
+
+  // The newly-added atom loop is at the end of block.items; rotate it
+  // back to the recorded position so the output preserves CCD order.
+  if (orig_pos != SIZE_MAX && !block.items.empty()) {
+    size_t new_pos = block.items.size() - 1;
+    if (new_pos != orig_pos && block.items[new_pos].has_prefix("_chem_comp_atom.")) {
+      cif::Item moved = std::move(block.items[new_pos]);
+      block.items.erase(block.items.begin() + new_pos);
+      if (orig_pos > block.items.size())
+        orig_pos = block.items.size();
+      block.items.insert(block.items.begin() + orig_pos, std::move(moved));
+    }
   }
 }
 
