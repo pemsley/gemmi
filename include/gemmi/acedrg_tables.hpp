@@ -367,6 +367,50 @@ struct GEMMI_DLL AcedrgTables {
   void load_prot_hydr_dists(const std::string& path);
   void load_angle_tables(const std::string& dir);
 
+  // Insert one parsed bond-table row into the in-memory indexes
+  // (bond_idx_1d_/_full_/_2d_ and the side key sets), using the same
+  // key construction as load_bond_tables(). Public so that an external
+  // backend can populate the tables row-by-row and then use
+  // fill_restraints() unchanged. key_buf/hybr_buf are scratch buffers
+  // that the caller can hoist out of its loop to avoid per-row allocation.
+  void insert_bond_row(int ha1, int ha2,
+                       const std::string& hybr_comb,
+                       const std::string& in_ring,
+                       const std::string& a1_nb2,
+                       const std::string& a2_nb2,
+                       const std::string& a1_nb,
+                       const std::string& a2_nb,
+                       const std::string& a1_type_m,
+                       const std::string& a2_type_m,
+                       const std::string& a1_type_f,
+                       const std::string& a2_type_f,
+                       const CodStats& vs,
+                       const CodStats& vs1d,
+                       std::string& key_buf,
+                       std::string& hybr_buf);
+
+  // Angle counterpart of insert_bond_row(): inserts one parsed angle-table
+  // row into angle_idx_1d_ ... angle_idx_5d_. v/s/c carry the six
+  // per-level value/sigma/count columns of the row.
+  void insert_angle_row(int ha1, int ha2, int ha3,
+                        const std::string& value_key,
+                        const std::string& a1_root,
+                        const std::string& a2_root,
+                        const std::string& a3_root,
+                        const std::string& a1_nb2,
+                        const std::string& a2_nb2,
+                        const std::string& a3_nb2,
+                        const std::string& a1_nb,
+                        const std::string& a2_nb,
+                        const std::string& a3_nb,
+                        const std::string& a1_type,
+                        const std::string& a2_type,
+                        const std::string& a3_type,
+                        const double v[6],
+                        const double s[6],
+                        const int c[6],
+                        std::string& key_buf);
+
  private:
   void compute_hash(CodAtomInfo& atom) const;
 
